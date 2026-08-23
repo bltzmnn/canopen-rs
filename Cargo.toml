@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["core", "canopen-402", "host", "cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0 OR MIT"
+authors = ["canopen-rs contributors"]
+
+[workspace.dependencies]
+canopen-core = { path = "core" }
+canopen-402 = { path = "canopen-402" }
+canopen-host = { path = "host" }
+socketcan = { version = "3.3", features = ["netlink"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+thiserror = "1.0"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

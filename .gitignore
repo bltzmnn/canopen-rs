@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CANopen storage files (test artifacts)
+*.params.txt
+node-*-params.txt
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated OD code (build.rs output)
+od_gen.rs
