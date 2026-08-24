@@ -1,0 +1,18 @@
+[submodule "ref/canopen"]
+	path = ref/canopen
+	url = https://github.com/canopen-python/canopen
+[submodule "ref/zencan"]
+	path = ref/zencan
+	url = https://github.com/mcbridejc/zencan
+[submodule "ref/oze-canopen"]
+	path = ref/oze-canopen
+	url = https://github.com/ozontech/oze-canopen
+[submodule "ref/canopen-rust"]
+	path = ref/canopen-rust
+	url = https://github.com/atomi-ai/canopen-rust
+[submodule "ref/CANopenLinux"]
+	path = ref/CANopenLinux
+	url = https://github.com/CANopenNode/CANopenLinux
+[submodule "ref/canopen-rs"]
+	path = ref/canopen-rs
+	url = https://github.com/KarpagamKarthikeyan/canopen-rs
