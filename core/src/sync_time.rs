@@ -75,7 +75,8 @@ impl TimeStamp {
     /// Converts from Unix epoch milliseconds.
     ///
     /// # Errors
-    /// [`Error::ValueOutOfRange`] for timestamps before 1984 or after 2184.
+    /// [`Error::ValueOutOfRange`] for timestamps before 1984-01-01 or after
+    /// 1984-01-01 + 65536 days (≈ 2163), the representable TIME_OF_DAY range.
     pub fn from_unix_ms(unix_ms: i64) -> Result<Self> {
         let since_1984 = unix_ms - UNIX_TO_1984_S * 1000;
         if !(0..MS_PER_DAY * 0x1_0000).contains(&since_1984) {

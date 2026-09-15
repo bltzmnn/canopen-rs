@@ -113,3 +113,113 @@ fn default_value_number_formats() {
         Some(OdExpr::NodeRelative { offset: 0 })
     );
 }
+
+/// Non-ASCII unquoted DefaultValue must not crash the parser (BUGS.md P2,
+/// third-round review): the `$NODEID` probe used to slice `body[..7]`,
+/// panicking when byte 7 fell inside a multi-byte character. Such a value
+/// is simply not a `$NODEID` expression and degrades like any other
+/// unparseable literal (string fallback via `apply_key`).
+#[test]
+fn non_ascii_default_value_does_not_panic() {
+    assert_eq!(OdExpr::parse("你好世界"), None);
+    assert_eq!(OdExpr::parse("abcdefé"), None);
+
+    // Whole-file level: one such line must still yield a usable dictionary.
+    let text = r#"
+[2000]
+ParameterName=Label
+DataType=0x0009
+AccessType=ro
+DefaultValue=你好世界
+"#;
+    let eds = parse(text).unwrap();
+    let od = eds.to_object_dictionary(1).unwrap();
+    assert_eq!(
+        od.read(Address::new(0x2000, 0)).unwrap(),
+        Value::Str("你好世界".to_string())
+    );
+}
+
+/// BUGS.md 八L8: `NodeIDSet` is a boolean commissioning flag, not a node id.
+#[test]
+fn nodeid_set_is_not_a_node_id() {
+    let text = r#"
+[DeviceComissioning]
+NodeIDSet=1
+"#;
+    let eds = parse(text).unwrap();
+    assert_eq!(
+        eds.configured_node_id, None,
+        "NodeIDSet must not be parsed as a NodeID"
+    );
+}
+
+/// BUGS.md 八L9: any non-zero PDOMapping marks the object mappable
+/// (CANFestival's `2` = "RPDO only" must not be rejected).
+#[test]
+fn pdo_mapping_two_is_mappable() {
+    let text = r#"
+[6000]
+ParameterName=Value
+DataType=0x0005
+AccessType=rw
+DefaultValue=0
+PDOMapping=2
+"#;
+    let eds = parse(text).unwrap();
+    let od = eds.to_object_dictionary(1).unwrap();
+    assert!(
+        od.entry(Address::new(0x6000, 0)).unwrap().pdo_mappable,
+        "PDOMapping=2 must be treated as mappable"
+    );
+}
+
+/// BUGS.md 八L10: `DefaultValue=+0x8000` (explicit plus) parses like python's
+/// `int(value, 0)` instead of failing the whole import.
+#[test]
+fn plus_signed_hex_default_parses() {
+    assert_eq!(OdExpr::parse("+0x8000"), Some(OdExpr::Literal(0x8000)));
+    let text = r#"
+[6001]
+ParameterName=Value
+DataType=0x0006
+AccessType=rw
+DefaultValue=+0x1234
+"#;
+    let eds = parse(text).unwrap();
+    let od = eds.to_object_dictionary(1).unwrap();
+    assert_eq!(
+        od.read(Address::new(0x6001, 0)).unwrap(),
+        Value::Uint(0x1234)
+    );
+}
+
+/// BUGS.md A3: a non-finite float default (`1e999` parses to `f64::INFINITY`)
+/// must generate a valid Rust literal instead of `Value::Real(inf)`, which
+/// did not compile. Both build exits (codegen and runtime) must accept it.
+#[test]
+fn non_finite_float_default_generates_compilable_literal() {
+    let text = r#"
+[6002]
+ParameterName=Huge
+DataType=0x0011
+AccessType=rw
+DefaultValue=1e999
+"#;
+    let eds = parse(text).unwrap();
+    let source = canopen_host::codegen::generate_od_module(&eds, "od_huge").unwrap();
+    assert!(
+        source.contains("f64::INFINITY"),
+        "non-finite default must emit f64::INFINITY:\n{source}"
+    );
+    assert!(
+        !source.contains("Value::Real(inf)"),
+        "invalid Rust literal leaked into generated source:\n{source}"
+    );
+    // Runtime exit agrees on the value.
+    let od = eds.to_object_dictionary(1).unwrap();
+    assert_eq!(
+        od.read(Address::new(0x6002, 0)).unwrap(),
+        Value::Real(f64::INFINITY)
+    );
+}

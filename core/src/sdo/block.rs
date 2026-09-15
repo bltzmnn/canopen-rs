@@ -33,7 +33,7 @@ pub(super) const CRC_SUPPORTED: u8 = 0x04;
 const SIZE_INDICATED: u8 = 0x02;
 
 pub(super) const SUBCMD_MASK: u8 = 0x03;
-const SUBCMD_INITIATE: u8 = 0x00;
+pub(super) const SUBCMD_INITIATE: u8 = 0x00;
 pub(super) const SUBCMD_END: u8 = 0x01;
 pub(super) const SUBCMD_RESPONSE: u8 = 0x02;
 pub(super) const SUBCMD_START: u8 = 0x03;
@@ -41,8 +41,9 @@ pub(super) const SUBCMD_START: u8 = 0x03;
 const LAST_SEGMENT: u8 = 0x80; // 'c' bit in a sub-block segment
 const SEQNO_MASK: u8 = 0x7F;
 
-/// Maximum data bytes in one sub-block segment.
-pub const SEGMENT_DATA_MAX: usize = 7;
+/// Maximum data bytes in one sub-block segment — single source of truth in
+/// the module root (`BUGS.md` L6).
+pub use super::SEGMENT_DATA_MAX;
 /// Maximum segments in one sub-block.
 pub const MAX_BLKSIZE: u8 = 127;
 
@@ -66,9 +67,11 @@ pub fn crc16(data: &[u8]) -> u16 {
 
 /// Whether a frame is a block **end** frame (`CS_6`, sub-command end).
 ///
-/// During an active block download every incoming frame is a sub-block
-/// segment *except* this one, so receivers check it first — segment frames'
-/// byte 0 carries a raw sequence number whose top bits vary.
+/// Recognised only in the `awaiting_end` phase — after a last-flagged segment
+/// has been acknowledged. While segments are still streaming, every incoming
+/// frame is routed as a sub-block segment first (their byte 0 carries a raw
+/// sequence number whose top bits overlap the end frame's shape), so callers
+/// must not check for the end frame unconditionally (`BUGS.md` 架构速查).
 #[must_use]
 pub fn is_end_frame(p: &SdoPayload) -> bool {
     p[0] & CS_MASK == CS_6 && p[0] & SUBCMD_MASK == SUBCMD_END
@@ -102,6 +105,10 @@ pub struct BlockNegotiation {
     pub blksize: u8,
     /// Whether the sender supports the end-of-transfer CRC.
     pub crc_support: bool,
+    /// Protocol switch threshold (byte 5 of the initiate request): the
+    /// client's hint that it prefers segmented transfer when the object is
+    /// not larger than this many bytes (CANopenNode `CO_SDOserver.c:939-944`).
+    pub pst: Option<u8>,
 }
 
 /// A decoded sub-block segment.
@@ -196,6 +203,12 @@ pub fn decode_upload_initiate_response(p: &SdoPayload) -> Result<BlockInitiate> 
 
 /// Encodes the client's **start block-upload** request (`CS_5`, sub-command
 /// start), telling the server to begin streaming segments.
+/// Encodes the client's start block-upload request.
+///
+/// Deliberately all-zero beyond the command byte, matching both reference
+/// implementations byte-for-byte (python-canopen `client.py:512`, CANopenNode
+/// `CO_SDOclient.c:1600`) — R10-P1-3's premise that byte 1/2 carry
+/// blksize/CRC is not borne out by either (`BUGS.md` 撤销项).
 #[must_use]
 pub fn encode_upload_start() -> SdoPayload {
     let mut p = [0u8; 8];
@@ -261,6 +274,9 @@ fn decode_initiate_with_blksize(cs: u8, p: &SdoPayload) -> Result<BlockNegotiati
         address: address_of(p),
         blksize: p[4],
         crc_support: p[0] & CRC_SUPPORTED != 0,
+        // Byte 5 carries the protocol-switch threshold; reserved-zero senders
+        // read as 0, which we normalise to "no switch requested".
+        pst: (p[5] != 0).then_some(p[5]),
     })
 }
 
@@ -353,18 +369,43 @@ pub fn encode_end_response() -> SdoPayload {
 
 /// Decodes an end response.
 ///
+/// CiA 301 block download end response byte 0 is `101 sc 01`; `sc = 1`
+/// means the server detected a CRC error and did **not** store the data.
+/// Such a response must not be mistaken for success (BUGS.md 八M6 —
+/// CANopenNode `CO_SDOclient.c:717-731` accepts only `0xA1`).
+///
 /// # Errors
-/// [`Error::UnexpectedFrame`] on a foreign command byte.
+/// [`Error::UnexpectedFrame`] on a foreign command byte,
+/// [`Error::CrcMismatch`] when the server reports `sc = 1`.
 pub fn decode_end_response(p: &SdoPayload) -> Result<()> {
-    if p[0] & CS_MASK != CS_5 || p[0] & SUBCMD_MASK != SUBCMD_END {
-        return Err(Error::UnexpectedFrame);
+    // CANopenNode `CO_SDOclient.c:717-731` accepts exactly 0xA1 (success)
+    // or 0xA5 (CRC error) — bit3 is reserved and any other bit pattern must
+    // be rejected instead of being folded into "success" (previously
+    // `0xA9`/`0xAB`/… slipped through the mask check).
+    if p[0] == CS_5 | SUBCMD_END {
+        return Ok(());
     }
-    Ok(())
+    if p[0] == CS_5 | SUBCMD_END | CRC_SUPPORTED {
+        return Err(Error::CrcMismatch);
+    }
+    Err(Error::UnexpectedFrame)
 }
 
 // --- Stateful helpers ----------------------------------------------------------
 
+/// Whether `blksize` is a legal sub-block size (`1..=127`). Values outside
+/// this range must be rejected with abort `0x0504_0002` per CiA 301 /
+/// CANopenNode `CO_SDOserver.c:953-958` — the previous silent clamp to 1
+/// masked malformed peers (BUGS.md P3-26).
+#[must_use]
+pub const fn is_valid_blksize(blksize: u8) -> bool {
+    blksize >= 1 && blksize <= MAX_BLKSIZE
+}
+
 /// Clamps a peer-proposed blksize into the legal `1..=127` range.
+///
+/// Prefer [`is_valid_blksize`] + an explicit `InvalidBlockSize` abort at
+/// protocol boundaries; this helper remains for display/limit math.
 #[must_use]
 pub fn clamp_blksize(blksize: u8) -> u8 {
     blksize.clamp(1, MAX_BLKSIZE)
@@ -533,13 +574,19 @@ impl BlockReceiver {
         verify_crc: bool,
     ) -> Result<()> {
         if let Some(n) = final_len {
-            if n > self.buf.len() {
+            // BUGS.md #23: trim the end-frame's `unused` tail *before*
+            // comparing against the declared size, exactly like CANopenNode
+            // (`sizeTran -= noData` then the size check). Declaring 10 but
+            // streaming 7+7 (with pad) must abort instead of storing the pad
+            // byte as data when CRC is not negotiated.
+            let data_len = self.buf.len().saturating_sub(usize::from(unused));
+            if data_len != n {
                 return Err(Error::BadLength {
                     declared: n,
-                    actual: self.buf.len(),
+                    actual: data_len,
                 });
             }
-            self.buf.truncate(n);
+            self.buf.truncate(data_len);
         } else {
             let unused = usize::from(unused);
             if unused > self.buf.len() {
@@ -582,7 +629,11 @@ mod tests {
         };
         assert!(r.push(&seg_bad, Some(10)).is_err());
 
-        // Fresh receiver: final segment may overshoot, then trim.
+        // Fresh receiver: final segment may overshoot, then trim. The final
+        // 7-byte segment carries 3 real bytes + 4 pad bytes; the end frame
+        // reports `unused=4` (BUGS.md #23), so `finish` trims the pad before
+        // comparing against the declared 10 — mirroring CANopenNode's
+        // `sizeTran -= noData` length check.
         let mut r = BlockReceiver::new();
         r.push(&seg1, Some(10)).unwrap();
         let seg_last = SubSegment {
@@ -591,8 +642,15 @@ mod tests {
             data: &[0xCC; 7],
         };
         r.push(&seg_last, Some(10)).unwrap();
-        r.finish(Some(10), 0, 0, false).unwrap();
+        r.finish(Some(10), 4, 0, false).unwrap();
         assert_eq!(r.into_inner().len(), 10);
+
+        // A mismatched declared size after trimming pad is an error, not a
+        // silent truncation (declares 10 but only 9 real bytes + 5 pad).
+        let mut r = BlockReceiver::new();
+        r.push(&seg1, Some(10)).unwrap();
+        r.push(&seg_last, Some(10)).unwrap();
+        assert!(r.finish(Some(10), 5, 0, false).is_err());
     }
 
     #[test]
@@ -651,6 +709,19 @@ mod tests {
         assert_eq!(decode_end(&encode_end(5, 0xBEEF)).unwrap(), (5, 0xBEEF));
         assert_eq!(encode_end_response(), [0xA1, 0, 0, 0, 0, 0, 0, 0]);
         assert!(decode_end_response(&encode_end_response()).is_ok());
+        // BUGS.md 八M6: sc=1 (CRC error, data not stored) must fail.
+        let crc_error = [0xA5, 0, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(
+            decode_end_response(&crc_error),
+            Err(Error::CrcMismatch)
+        ));
+        // Reserved bit3 (0x08) must be rejected instead of being folded
+        // into success by a mask check.
+        let reserved = [0xA9, 0, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(
+            decode_end_response(&reserved),
+            Err(Error::UnexpectedFrame)
+        ));
     }
 
     #[test]

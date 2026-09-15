@@ -33,6 +33,13 @@ const FLASH_4: u8 = 0x20;
 const CANOPEN: u8 = 0x80;
 
 /// Input snapshot for one [`Leds::process`] call.
+/// Overall visible period of the LED timing state machine (ms): the LCM of
+/// flicker 100 ms, blink 800 ms and the flash bursts 1200/1600/2000 ms is
+/// 24 s — 4.8 s was wrong because flash_3 does not divide it
+/// (`BUGS.md` R10-P2-14).
+const LED_STATE_PERIOD_MS: u32 = 24000;
+
+/// Per-tick error inputs to the CiA 303-3 state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LedInputs {
     /// Current NMT state.
@@ -85,6 +92,19 @@ impl Default for Leds {
     }
 }
 
+/// Reduces an elapsed-time delta to the LED state machine's overall visible
+/// period. Every internal timer is periodic with a period dividing 24 s
+/// (flicker 100 ms, blink 800 ms, flash bursts 1.2/1.6/2.0/2.4 s), so a delta
+/// reduced modulo that period produces byte-identical outputs while capping
+/// the tick loop — a single call with `u32::MAX` ms previously spun ~86
+/// million iterations (`BUGS.md` P3-47). 24 s is the least common multiple
+/// of every flash period (4.8 s was too short for flash_3's 2.0 s cycle,
+/// `BUGS.md` R10-P2-14).
+fn reduce_elapsed(elapsed_ms: u64) -> u32 {
+    let capped = elapsed_ms.min(u64::from(u32::MAX)) as u32;
+    capped % LED_STATE_PERIOD_MS
+}
+
 impl Leds {
     /// All patterns dark.
     #[must_use]
@@ -111,9 +131,7 @@ impl Leds {
         let mut gr = 0u8;
         let mut ticked = false;
 
-        self.acc_ms = self
-            .acc_ms
-            .saturating_add(elapsed_ms.min(u64::from(u32::MAX)) as u32);
+        self.acc_ms = self.acc_ms.saturating_add(reduce_elapsed(elapsed_ms));
         while self.acc_ms >= 50 {
             ticked = true;
             self.acc_ms -= 50;

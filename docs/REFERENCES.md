@@ -32,7 +32,7 @@
 |---|---|---|---|
 | S1 | **状态机即文档**：SDO 每个状态枚举值注释完整报文字节布局，高 nibble 编码方向/模式 | `301/CO_SDOserver.h:90-287` | Rust 状态 enum 全部带文档注释 + golden-byte 测试 |
 | S2 | **Block 下载 RX 路径直接落盘**：RX 回调内校验 seqno 连续性后直接 memcpy 进线性缓冲，不经中间暂存 | `301/CO_SDOserver.c:68-126` | block 数据段处理独立成纯函数，seqno 即时判定 |
-| S3 | **blksize 从缓冲容量自适应推导**（`(BUFFER_SIZE-2)/7`，上限 127），缓冲将满时先 flush 到 OD 再收缩子块 | `CO_SDOserver.c:1294-1299,1332-1347` | blksize = min(127, 剩余容量/7)，std 下按通道 Vec 动态配置 |
+| S3 | **blksize 从缓冲容量自适应推导**（`(BUFFER_SIZE-2)/7`，上限 127），缓冲将满时先 flush 到 OD 再收缩子块 | `CO_SDOserver.c:1294-1299,1332-1347` | **未照搬**：接收缓冲为动态 Vec，服务端 clamp 对端提案到 1..=127，客户端恒提案 127（见 IMPLEMENTATION §5.3、BUGS.md 已知局限） |
 | S4 | **环形缓冲 alt-read 双指针**实现 block 上传流水线+CRC 复核：数据确认前不提交读指针 | `CO_fifo.h:245-296`, `CO_SDOclient.h:182-184` | 用 `BytesMut` split/冻结语义安全表达 |
 | S5 | **RPDO 同步双缓冲 + toggle 位**：以 SYNC toggle 区分"本周期"与"上一周期"数据，严格实现"同步 RPDO 在下一 SYNC 后生效"，无锁 | `CO_PDO.c:454-464,731-736`; `CO_SYNC.h:57-61` | `RpdoSlot` 双缓冲设计 |
 | S6 | **timerNext_us 协作式调度输出**贯穿所有 process 函数：process 返回"下次何时需要我"，OS 定向唤醒而非忙轮询 | `CANopen.c:1311-1503` | host 层 tokio `sleep_until(next_event)`；core 的 poll 函数返回下次到期时间 |
@@ -110,9 +110,9 @@
 | P13 | **分层值访问管线** raw→phys(factor/unit)→desc(enum)→bits，宽参数化编解码器（struct.Struct over N bytes） | `objectdictionary/__init__.py:448-567`; `datatypes.py:60,93`; `variable.py:14-136` | OD Variable 四层 decode trait；DataType 按 width 参数化 |
 | P14 | PDO 配置语义最全建模：COB-ID valid/RTR 位、传输类型、inhibit/event-timer/sync-start；区分从节点读回 vs 从 OD 默认读取 | `pdo/base.py:353-417,379-399` | PdoConfig 结构体（见 IMPLEMENTATION §7） |
 | P15 | 自发送防环：PDO 收到自己发的帧忽略；RPDO 周期测量自动推断 period | `pdo/base.py:331-342,314-329` | RPDO 接收过滤 + 周期估计 |
-| P16 | 表驱动 CiA 402：statusword mask/value 表 + 完整转移表 `(from,to)->command` + 间接路径解析器 | `p402.py:41-104` | 静态表驱动 402 状态机（路线图） |
-| P17 | EDS 双向：导入（$NODEID 替换、枚举/位定义）、导出 EDS/DCF、经 0x1021 从设备 SDO 取 EDS | `objectdictionary/eds.py:26,187,415` | EDS 导入第一期；导出/0x1021 列入路线图 |
-| P18 | EMCY 消费者环形日志（最近 8 条）+ EmcyError 描述查表 | `emcy.py:18-45,105-134` | EmcyListener 设计 |
+| P16 | 表驱动 CiA 402：statusword mask/value 表 + 完整转移表 `(from,to)->command` + 间接路径解析器 | `p402.py:41-104` | 静态表驱动 402 状态机（路线图，已裁决移除） |
+| P17 | EDS 双向：导入（$NODEID 替换、枚举/位定义）、导出 EDS/DCF、经 0x1021 从设备 SDO 取 EDS | `objectdictionary/eds.py:26,187,415` | EDS 导入第一期 + 0x1021 已实现；导出已裁决不做 |
+| P18 | EMCY 消费者环形日志（最近 8 条）+ EmcyError 描述查表 | `emcy.py:18-45,105-134` | core EmcyConsumer（已实现） |
 
 ### 2.2 改进的缺点
 
@@ -171,9 +171,9 @@
 | sans-I/O core + `on_frame` 契约 | canopen-rs | docs/ARCHITECTURE.md | 保留 |
 | SDO 状态机文档化 | CANopenNode | CO_SDOserver.h:90-287 | Rust doc comment + golden 测试 |
 | block transfer 集成状态机 | CANopenNode | CO_SDOserver.c:593-1520 | 拆纯函数转移，非巨型 switch |
-| blksize 自适应 + 会话超时 | CANopenNode + python | CO_SDOserver.c:1294; client.py:86-101 | Duration 参数化 |
+| blksize 协商（上限 127）+ 会话超时 | CANopenNode + python | CO_SDOserver.c:1294; client.py:86-101,461 | clamp_blksize 夹提案；Duration 参数化 |
 | client 超时后 ABORT 对端再重试 | python-canopen | sdo/client.py:86-101 | 默认重试策略 |
-| 流式 open() API | python-canopen | sdo/client.py:166-227 | async AsyncRead/Write 实现 |
+| 流式 open() API（路线图） | python-canopen | sdo/client.py:166-227 | async AsyncRead/Write 实现 |
 | OD 回调条目 + abort 映射 | CANopenNode | CO_ODinterface.h:245-263,129-159 | ObjectAccess trait + From<Error> for AbortCode |
 | 分层值访问 raw/phys/desc/bits | python-canopen | od/__init__.py:448-567 | 四层 decode 方法 |
 | RPDO 同步双缓冲 | CANopenNode | CO_PDO.c:454-464 | RpdoSlot 双缓冲 |
@@ -190,5 +190,5 @@
 | EDS $NODEID 惰性求值 | python 缺陷反推 | eds.py:254-258 | OdValue::NodeRelative(expr) |
 | timerNext 协作调度 | CANopenNode | CANopen.c:1311-1503 | tokio sleep_until 直通 |
 | Instant 单调时钟 | python 缺陷反推 | emcy.py:71 等 | 全栈统一 |
-| CiA 402 profile 层（路线图） | python-canopen | p402.py:41-104 | 表驱动 + watch channel |
+| CiA 402 profile 层（已裁决移除） | python-canopen | p402.py:41-104 | 表驱动 + watch channel |
 | oracle 对拍测试法 | canopen-rs | tools/interop/ | 扩展覆盖 block/LSS |

@@ -1,5 +1,11 @@
 # 交叉验证测试计划（Cross-Validation Test Plan）
 
+> **实现状态**（2026-09-14）：本计划为**待实施路线图**。下方引用的
+> `host/tests/xcan_s1_canopenlinux_slave.rs`、`tools/interop/python_slave_node.py`、
+> `tools/interop/s4_python_master.py`、`host/examples/served_node` 等测试资产
+> **尚未实现**；当前已交付的总线级验证仅 `host/tests/vcan.rs` 的自回环测试。
+> `docs/IMPLEMENTATION.md` §14 已同步标注。
+
 本测试计划将 canopen-rs 与两个独立参考实现进行**四向交叉验证**：
 
 | 套件 | 我方角色 | 对端 | 对端实现 |

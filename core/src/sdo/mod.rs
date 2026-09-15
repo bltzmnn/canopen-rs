@@ -7,8 +7,8 @@
 //! requests against an `ObjectDictionary` and
 //! [`SdoClient`] drives transactions — both sans-I/O.
 //!
-//! This module covers **expedited** (≤4 bytes inline) and **segmented**
-//! transfer. Block transfer is integrated in phase P4.
+//! This module covers **expedited** (≤4 bytes inline), **segmented** and
+//! **block** transfer (see [`sdo::block`](self::block)).
 //!
 //! # Example: expedited download frame
 //!
@@ -338,6 +338,11 @@ pub fn encode_download_response(addr: Address) -> SdoPayload {
 ///
 /// # Errors
 /// [`Error::UnexpectedFrame`] if not a download-initiate response.
+///
+/// Decoder leniency note (`BUGS.md` R10-P3): command-specifier matching in
+/// these decoders is mask-based and tolerant of stray low bits by design —
+/// strict per-byte frame classification lives in the state machines, and any
+/// junk that slips past still fails address/index checks downstream.
 pub fn decode_download_response(p: &SdoPayload) -> Result<Address> {
     if p[0] & CS_MASK != SCS_DOWNLOAD_INITIATE {
         return Err(Error::UnexpectedFrame);
@@ -516,8 +521,10 @@ pub fn encode_data_segment(data: &[u8], toggle: bool, last: bool) -> Result<SdoP
     }
     let mut p = [0u8; 8];
     // ccs/scs for a data segment are both 000, so top bits stay clear.
+    // (`BUGS.md` L6: the former `& 0x0E` was redundant — `n <= 7` already
+    // bounds `n << 1` to 4 bits.)
     let n = (SEGMENT_DATA_MAX - data.len()) as u8;
-    p[0] = (n << 1) & 0x0E;
+    p[0] = n << 1;
     if toggle {
         p[0] |= TOGGLE;
     }
@@ -669,6 +676,11 @@ impl SegmentBuffer {
     }
 
     /// Appends a decoded segment.
+    ///
+    /// Buffer-layer note (`BUGS.md` R10-P3): this layer does not require the
+    /// final segment to land exactly on the declared size — the
+    /// `download_segment` finish step enforces that with
+    /// `TypeMismatchLengthLow`, so the codec stays permissive by design.
     ///
     /// # Errors
     /// - [`Error::ToggleBit`] when out of sequence;

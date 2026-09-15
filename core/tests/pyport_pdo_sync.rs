@@ -1,6 +1,12 @@
 //! Port of `ref/canopen/test/test_pdo.py`, `test_sync.py`, `test_time.py`
 //! subsets — PDO config via SDO, SYNC-triggered TPDO, RPDO write-back and
 //! TIME codec round-trip (docs/EXTENSIONS.md 批次 D P-c).
+//!
+//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! python-canopen's suite and are **not** re-checked by `cargo test` against
+//! `ref/`. After touching any codec, run
+//! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the
+//! transcription against the reference implementation.
 
 use canopen_core::datatypes::{DataType, Value};
 use canopen_core::node::Node;

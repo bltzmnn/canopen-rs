@@ -91,7 +91,12 @@ impl ParameterStorage for MockBackend {
         Ok(())
     }
 
-    fn reset(&self, od: &mut ObjectDictionary, defaults: &ObjectDictionary) -> Result<()> {
+    fn reset(
+        &self,
+        od: &mut ObjectDictionary,
+        defaults: &ObjectDictionary,
+        _group: u8,
+    ) -> Result<()> {
         self.resets.fetch_add(1, Ordering::Relaxed);
         for (addr, entry) in defaults.iter() {
             if entry.persistent {
@@ -126,9 +131,35 @@ fn save_magic_triggers_backend_via_sdo_path() {
         &[(0x6000, 1, 0xBEEF)]
     );
 
-    // Wrong magic does nothing.
-    sdo_write(&mut node, Address::new(0x1010, 1), &0xDEADu32.to_le_bytes());
+    // Wrong magic is rejected with DataCannotBeTransferred (CANopenNode
+    // `OD_write_1010` -> `ODR_DATA_TRANSF`) and the backend is not called.
+    assert_eq!(
+        sdo_write_expect_abort(&mut node, Address::new(0x1010, 1), &0xDEADu32.to_le_bytes()),
+        canopen_core::sdo::SdoAbortCode::DataCannotBeTransferred
+    );
     assert_eq!(backend.saves.load(Ordering::Relaxed), 1);
+}
+
+/// Drives a write expected to end in an SDO abort; returns the code.
+fn sdo_write_expect_abort(
+    node: &mut Node,
+    addr: Address,
+    raw: &[u8],
+) -> canopen_core::sdo::SdoAbortCode {
+    let mut client = SdoClient::new();
+    let first = client.write(addr, raw).unwrap();
+    let mut queue: std::collections::VecDeque<[u8; 8]> = first.into();
+    while let Some(frame) = queue.pop_front() {
+        for resp in node.on_frame(0x600 + u16::from(NODE), &frame) {
+            match client.on_response(&resp.data) {
+                Ok(SdoEvent::Send(frames)) => queue.extend(frames),
+                Ok(_) => {}
+                Err(canopen_core::types::Error::SdoAborted(code)) => return code,
+                Err(e) => panic!("unexpected error {e:?}"),
+            }
+        }
+    }
+    panic!("transaction completed without abort");
 }
 
 #[test]
@@ -154,16 +185,19 @@ fn load_magic_reapplies_and_reset_restores_defaults() {
         Value::Uint(111) // construction-time default
     );
 
-    // Group 2 'load': plain re-application of the stored set.
+    // Group 2 'load': restore defaults for group 2 — the old "replay saved
+    // values" behaviour was a CiA-semantics mistake (BUGS.md P2-13); every
+    // 0x1011:*sub* write is a reset for that group.
     sdo_write(
         &mut node,
         Address::new(0x1011, 2),
         &LOAD_MAGIC_U32.to_le_bytes(),
     );
-    assert_eq!(backend.loads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.resets.load(Ordering::Relaxed), 2);
+    assert_eq!(backend.loads.load(Ordering::Relaxed), 0);
     assert_eq!(
         node.od().read(Address::new(0x6000, 1)).unwrap(),
-        Value::Uint(777)
+        Value::Uint(111) // back to construction-time default, not 777
     );
     // Non-persistent entry untouched by the whole flow.
     assert_eq!(

@@ -52,6 +52,13 @@ impl AccessType {
 /// propagates verbatim — the SDO server converts it into an abort code
 /// (`From<Error> for AbortCode` mapping), so validation failures inside the
 /// application surface precisely to the remote client.
+///
+/// # Contract
+///
+/// Implementations must **not panic**: a panic inside `read`/`write`
+/// propagates through [`ObjectDictionary::read`] / [`ObjectDictionary::write`]
+/// into the caller's `Node::poll` / `Node::on_frame` stack (unlike EMCY
+/// consumer callbacks, which are isolated) (`BUGS.md` P3-43).
 pub trait ObjectAccess: Send + Sync {
     /// Reads the current value for the addressed subentry.
     ///
@@ -136,9 +143,10 @@ impl Entry {
 
     /// Reads through the storage without access control.
     ///
-    /// Used internally by the SDO server to learn an entry's type before
-    /// deciding how to respond; external readers go through
-    /// [`ObjectDictionary::read`].
+    /// Reads the current stored value, bypassing access checks — used by
+    /// internal consumers (e.g. the SDO server to learn an entry's type, or
+    /// PDO packing) that already know the entry is readable; external
+    /// readers go through [`ObjectDictionary::read`].
     ///
     /// # Errors
     /// Propagates callback errors for [`Storage::Callback`].
@@ -157,6 +165,10 @@ impl Entry {
 #[derive(Debug, Default, Clone)]
 pub struct ObjectDictionary {
     entries: BTreeMap<Address, Entry>,
+    /// Addresses successfully written since the last [`Self::take_dirty`]
+    /// drain (`BUGS.md` P3-11): the flagsPDO trigger source for
+    /// event-driven TPDOs.
+    dirty: std::collections::BTreeSet<Address>,
 }
 
 impl ObjectDictionary {
@@ -214,25 +226,18 @@ impl ObjectDictionary {
                 index: addr.index,
                 subindex: addr.subindex,
             })?;
-        if let Some(size) = entry.data_type.fixed_size() {
-            let mut buf = [0u8; 8];
-            if size > buf.len() {
-                return Err(Error::BadLength {
-                    declared: size,
-                    actual: buf.len(),
-                });
-            }
-            value
-                .encode_as(entry.data_type, &mut buf[..size])
-                .map_err(|e| Self::with_addr(e, addr))?;
-        }
-        match &mut entry.storage {
+        Self::check_encode(entry.data_type, addr, &value)?;
+        let outcome = match &mut entry.storage {
             Storage::Value(slot) => {
-                *slot = normalize(value, entry.data_type);
+                *slot = value;
                 Ok(())
             }
-            Storage::Callback(cb) => cb.write(addr, normalize(value, entry.data_type)),
+            Storage::Callback(cb) => cb.write(addr, value.clone()),
+        };
+        if outcome.is_ok() {
+            self.dirty.insert(addr);
         }
+        outcome
     }
 
     /// Fills in the addressed entry on context-free errors (`encode_as` has
@@ -263,7 +268,7 @@ impl ObjectDictionary {
             subindex: addr.subindex,
         })?;
         if !entry.access.is_readable() {
-            return Err(Error::AccessDenied { addr });
+            return Err(Error::AccessDenied { addr, read: true });
         }
         entry.raw_read(addr)
     }
@@ -291,70 +296,65 @@ impl ObjectDictionary {
                 subindex: addr.subindex,
             })?;
         if !entry.access.is_writable() {
-            return Err(Error::AccessDenied { addr });
+            return Err(Error::AccessDenied { addr, read: false });
         }
-        // Type/range check against the declared type. We encode into a
-        // scratch buffer only for fixed-size types; variable-length types
-        // accept any content.
-        if let Some(size) = entry.data_type.fixed_size() {
-            let mut buf = [0u8; 8];
-            if size > buf.len() {
-                return Err(Error::BadLength {
-                    declared: size,
-                    actual: buf.len(),
-                });
-            }
-            value.encode_as(entry.data_type, &mut buf[..size])?;
-        } else {
-            // Variable-length: only check kind compatibility by encoding
-            // into a throwaway buffer sized to the value.
-            let n = value.encoded_len();
-            let mut buf = vec![0u8; n];
-            value.encode_as(entry.data_type, &mut buf)?;
-        }
-        match &mut entry.storage {
+        // Type/range check against the declared type — shared with
+        // `set_value` via `check_encode` (single source of truth,
+        // `BUGS.md` R10-P3).
+        Self::check_encode(entry.data_type, addr, &value)?;
+        let outcome = match &mut entry.storage {
             Storage::Value(slot) => {
-                *slot = normalize(value, entry.data_type);
+                *slot = value;
                 Ok(())
             }
-            Storage::Callback(cb) => cb.write(addr, normalize(value, entry.data_type)),
+            Storage::Callback(cb) => cb.write(addr, value.clone()),
+        };
+        if outcome.is_ok() {
+            self.dirty.insert(addr);
         }
+        outcome
     }
-}
 
-/// Coerces an integer value into the canonical variant of `dt`.
-///
-/// A `Value::Uint(5)` written under a signed type becomes
-/// `Value::Int(5)` (and vice versa) so stored values report the declared
-/// type family; non-integer values pass through unchanged.
-fn normalize(value: Value, dt: DataType) -> Value {
-    let signed = matches!(
-        dt,
-        DataType::Integer8
-            | DataType::Integer16
-            | DataType::Integer24
-            | DataType::Integer32
-            | DataType::Integer40
-            | DataType::Integer48
-            | DataType::Integer56
-            | DataType::Integer64
-    );
-    let unsigned = !signed
-        && matches!(
-            dt,
-            DataType::Unsigned8
-                | DataType::Unsigned16
-                | DataType::Unsigned24
-                | DataType::Unsigned32
-                | DataType::Unsigned40
-                | DataType::Unsigned48
-                | DataType::Unsigned56
-                | DataType::Unsigned64
-        );
-    match (value, signed, unsigned) {
-        (Value::Uint(v), true, _) => Value::Int(v as i64),
-        (Value::Int(v), _, true) => Value::Uint(v as u64),
-        (other, ..) => other,
+    /// Type/width validation shared by [`Self::set_value`] and
+    /// [`Self::write`]: fixed-size types must fit a CAN-frame-width scratch
+    /// buffer and re-encode exactly; variable-length kinds are checked by
+    /// encoding into a throwaway buffer (`BUGS.md` P3-48).
+    fn check_encode(dt: DataType, addr: Address, value: &Value) -> Result<()> {
+        if let Some(size) = dt.fixed_size() {
+            // Fixed-size types are at most 8 bytes (the CAN-frame width), so
+            // `size > 8` can never happen — the branch was dead code
+            // (`BUGS.md` L2); keep the invariant as a debug assertion.
+            let mut buf = [0u8; 8];
+            debug_assert!(size <= buf.len(), "fixed_size() exceeds 8 bytes");
+            value
+                .encode_as(dt, &mut buf[..size])
+                .map_err(|e| Self::with_addr(e, addr))?;
+        } else {
+            // Variable-length: only check kind compatibility by encoding
+            // into a throwaway buffer sized to the value. The absolute
+            // value cap mirrors the SDO side so an over-long value can
+            // never be stored yet unreadable on the wire (BUGS.md #31).
+            // `encoded_len_as` covers target types whose wire form is wider
+            // than the value's minimal one (UNICODE_STRING UTF-16LE,
+            // BUGS.md L7).
+            let n = value.encoded_len_as(dt);
+            if n > crate::datatypes::MAX_VALUE_LEN {
+                return Err(Error::BadLength {
+                    declared: crate::datatypes::MAX_VALUE_LEN,
+                    actual: n,
+                });
+            }
+            let mut buf = vec![0u8; n];
+            value.encode_as(dt, &mut buf)?;
+        }
+        Ok(())
+    }
+
+    /// Drains the set of addresses written since the last call (BUGS.md
+    /// P3-11): consumed by `Node::poll` to fire event-driven TPDOs whose
+    /// mappings were touched (flagsPDO semantics).
+    pub fn take_dirty(&mut self) -> std::collections::BTreeSet<Address> {
+        std::mem::take(&mut self.dirty)
     }
 }
 
@@ -419,7 +419,8 @@ mod tests {
         assert_eq!(
             od.write(Address::new(0x2000, 0), Value::Uint(9)),
             Err(Error::AccessDenied {
-                addr: Address::new(0x2000, 0)
+                addr: Address::new(0x2000, 0),
+                read: false
             })
         );
         // wo: writable, not readable
@@ -427,7 +428,8 @@ mod tests {
         assert_eq!(
             od.read(Address::new(0x2001, 0)),
             Err(Error::AccessDenied {
-                addr: Address::new(0x2001, 0)
+                addr: Address::new(0x2001, 0),
+                read: true
             })
         );
         // rw: both work, value persists

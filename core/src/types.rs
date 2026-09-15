@@ -5,7 +5,7 @@ use core::fmt;
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Highest CANopen node ID (used internally by LSS for "unconfigured").
+/// LSS 未配置哨兵（合法总线节点上限为 `MAX_NODE_ID = 127`，此值非最高合法 id）。
 pub const UNCONFIGURED_NODE_ID: u8 = 0xFF;
 /// Highest valid node ID on the bus.
 pub const MAX_NODE_ID: u8 = 127;
@@ -27,10 +27,15 @@ pub enum Error {
     },
     /// Access violates the entry's access type (read of write-only, write
     /// of read-only).
-    #[error("access denied at {addr}")]
+    #[error("access denied at {addr}: {dir}", dir = if *read { "read of write-only object" } else { "write to read-only object" })]
     AccessDenied {
         /// Address that was violated.
         addr: Address,
+        /// `true` for a *read* of a write-only object, `false` for a *write*
+        /// to a read-only one (`BUGS.md` P3-34): lets direct OD users map to
+        /// the precise abort codes 0x0601_0001 / 0x0601_0002 instead of the
+        /// generic local-control code.
+        read: bool,
     },
     /// The value's data type does not match the entry's declared type.
     #[error("type mismatch at {addr}: expected {expected:?}, got {actual:?}")]
@@ -61,6 +66,9 @@ pub enum Error {
     /// Segmented transfer toggle bit out of sequence.
     #[error("toggle bit out of sequence")]
     ToggleBit,
+    /// Block-transfer sub-block size outside the legal `1..=127` range.
+    #[error("invalid block size")]
+    InvalidBlockSize,
     /// Block transfer CRC-16 check failed.
     #[error("block transfer CRC mismatch")]
     CrcMismatch,
@@ -68,6 +76,10 @@ pub enum Error {
     #[error("unexpected frame in current state")]
     UnexpectedFrame,
     /// A numeric value is out of the allowed range.
+    ///
+    /// Display fields are clamped to `i64` for message formatting only;
+    /// range *decisions* use full-width arithmetic (u64 above `i64::MAX`
+    /// aborts correctly but displays saturated) (`BUGS.md` P3-37).
     #[error("value {value} out of range [{min}, {max}]")]
     ValueOutOfRange {
         /// Offending value.
@@ -77,9 +89,22 @@ pub enum Error {
         /// Inclusive maximum.
         max: i64,
     },
+    /// A value is not a legal member of its parameter enumeration (reserved
+    /// COB-ID flags, reserved 0x1019 counter value 1, …). Mapped to
+    /// `SdoAbortCode::InvalidValue` (0x0609_0030) like CANopenNode's
+    /// `ODR_INVALID_VALUE`, instead of a range "too low/high" code
+    /// (`BUGS.md` 十L2).
+    #[error("invalid value")]
+    InvalidValue,
     /// A generic error with a message (last resort; prefer typed variants).
     #[error("{0}")]
     Other(&'static str),
+    /// The written data cannot be transferred or stored (e.g. a non-magic
+    /// word written to the 0x1010/0x1011 storage records). Mapped to
+    /// `SdoAbortCode::DataCannotBeTransferred` (0x0800_0020), matching
+    /// CANopenNode's `ODR_DATA_TRANSF`.
+    #[error("data cannot be transferred or stored")]
+    DataCannotBeTransferred,
     /// The remote SDO server aborted the transaction.
     #[error("SDO aborted: {0}")]
     SdoAborted(crate::sdo::SdoAbortCode),
@@ -101,12 +126,29 @@ impl Error {
         use crate::sdo::SdoAbortCode;
         match self {
             Error::ObjectDoesNotExist { .. } => Some(SdoAbortCode::ObjectDoesNotExist),
-            Error::AccessDenied { .. } => Some(SdoAbortCode::AccessDeniedDueToLocalControl),
-            Error::TypeMismatch { .. } | Error::BadLength { .. } => {
-                Some(SdoAbortCode::TypeMismatchLengthLow)
+            Error::AccessDenied { addr, read } => {
+                let _ = addr;
+                if *read {
+                    Some(SdoAbortCode::ReadOfWriteOnlyObject)
+                } else {
+                    Some(SdoAbortCode::WriteOfReadOnlyObject)
+                }
             }
+            Error::TypeMismatch { .. } => Some(SdoAbortCode::TypeMismatchLengthLow),
+            // BUGS.md L2: an over-long payload is the *high* variant — the
+            // generic fallback previously always reported "too low".
+            Error::BadLength { declared, actual } => Some(if actual > declared {
+                SdoAbortCode::TypeMismatchLengthHigh
+            } else {
+                SdoAbortCode::TypeMismatchLengthLow
+            }),
             Error::ToggleBit => Some(SdoAbortCode::ToggleNotAlternated),
-            Error::CrcMismatch => Some(SdoAbortCode::GeneralError),
+            // BUGS.md 八L7: invalid block size has its own CiA 301 code
+            // (0x0504_0002) instead of a generic error.
+            Error::InvalidBlockSize => Some(SdoAbortCode::InvalidBlockSize),
+            // BUGS.md M1: block-transfer CRC failure must surface as the
+            // specific 0x0504_0004 code, not a generic error.
+            Error::CrcMismatch => Some(SdoAbortCode::CrcError),
             Error::UnexpectedFrame | Error::BufferTooSmall { .. } => None,
             Error::ValueOutOfRange { value, min, .. } => {
                 // Below the inclusive range → ValueTooLow; at/above the
@@ -118,6 +160,8 @@ impl Error {
                     SdoAbortCode::ValueTooHigh
                 })
             }
+            Error::InvalidValue => Some(SdoAbortCode::InvalidValue),
+            Error::DataCannotBeTransferred => Some(SdoAbortCode::DataCannotBeTransferred),
             Error::SdoAborted(code) => Some(*code),
             Error::Io(_) | Error::Other(_) => Some(SdoAbortCode::GeneralError),
         }
@@ -233,6 +277,34 @@ mod tests {
         assert_eq!(
             err.abort_code(),
             Some(crate::sdo::SdoAbortCode::ValueTooHigh)
+        );
+    }
+
+    #[test]
+    fn bad_length_and_crc_map_to_specific_aborts() {
+        use crate::sdo::SdoAbortCode;
+        // BUGS.md L2: over-long payload → LengthHigh, short → LengthLow.
+        let over = Error::BadLength {
+            declared: 2,
+            actual: 4,
+        };
+        assert_eq!(
+            over.abort_code(),
+            Some(SdoAbortCode::TypeMismatchLengthHigh)
+        );
+        let short = Error::BadLength {
+            declared: 4,
+            actual: 2,
+        };
+        assert_eq!(
+            short.abort_code(),
+            Some(SdoAbortCode::TypeMismatchLengthLow)
+        );
+        // BUGS.md M1: CRC mismatch → the dedicated 0x0504_0004 code, not a
+        // generic error.
+        assert_eq!(
+            Error::CrcMismatch.abort_code(),
+            Some(SdoAbortCode::CrcError)
         );
     }
 

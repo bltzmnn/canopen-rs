@@ -15,6 +15,61 @@ use crate::datatypes::{DataType, Value};
 use crate::object_dictionary::ObjectDictionary;
 use crate::types::{Address, Error, NodeId, Result};
 
+/// Validates an SDO write into a PDO communication record (`0x1400..=0x15FF`
+/// RPDO / `0x1800..=0x19FF` TPDO, subindex 1 = COB-ID) before it reaches the
+/// dictionary. The CiA 301 bit-layout rule is enforced here
+/// (`CO_PDO.c:503-509`, `BUGS.md` P2-5): bits 29..11 must be clear (11-bit
+/// CAN-ID space), and identifier 0 (the NMT command COB) is rejected.
+///
+/// The stricter CANopenNode write-time rules — PDO must be disabled before
+/// its mapping changes, and a COB-ID cannot be enabled while the mapping is
+/// empty (`ODR_UNSUPP_ACCESS` / `ODR_INVALID_VALUE`) — are deliberately NOT
+/// applied here: canopen-rs rebuilds PDO slots live on every write in the
+/// `0x1400..=0x1BFF` range (IMPLEMENTATION §7.3), so masters may configure
+/// in either order. The empty-mapping case is instead caught at runtime
+/// assembly and reported via the bounded config-error ring (`BUGS.md` 八M2).
+///
+/// Writes anywhere else pass through untouched.
+pub fn guard_comm_record_write(addr: Address, value: &Value) -> Result<()> {
+    let in_comm_range = (RPDO_COMM_BASE..=0x15FF).contains(&addr.index)
+        || (TPDO_COMM_BASE..=0x19FF).contains(&addr.index);
+    if !in_comm_range || addr.subindex != 1 {
+        return Ok(());
+    }
+    let Value::Uint(raw) = value else {
+        return Ok(()); // type checking happens in the OD layer
+    };
+    let raw = *raw as u32;
+    if raw & 0x3FFF_F800 != 0 {
+        return Err(Error::ValueOutOfRange {
+            value: i64::from(raw),
+            min: 0,
+            max: 0x3FFF_F7FF,
+        });
+    }
+    if raw & COB_ID_INVALID == 0 && raw & 0x7FF == 0 {
+        // CAN-ID 0 is the NMT command channel — never a legal PDO
+        // identifier (BUGS.md 八M1; CANopenNode rejects it at write time,
+        // `CO_PDO.c:507`, with `ODR_INVALID_VALUE` — 十L2).
+        return Err(Error::InvalidValue);
+    }
+    Ok(())
+}
+
+/// CiA 301 restricted CAN-IDs, mirroring CANopenNode's
+/// `CO_IS_RESTRICTED_CAN_ID` (`CO_driver.h:420-422`): identifiers that are
+/// reserved for NMT/SDO/heartbeat and must not be used for SYNC, TIME,
+/// EMCY or PDO.
+#[must_use]
+pub const fn is_restricted_can_id(can_id: u16) -> bool {
+    can_id <= 0x7F
+        || (can_id >= 0x101 && can_id <= 0x180)
+        || (can_id >= 0x581 && can_id <= 0x5FF)
+        || (can_id >= 0x601 && can_id <= 0x67F)
+        || (can_id >= 0x6E0 && can_id <= 0x6FF)
+        || can_id >= 0x701
+}
+
 /// Base index of RPDO communication parameters (`0x1400 + n-1`).
 pub const RPDO_COMM_BASE: u16 = 0x1400;
 /// Base index of RPDO mapping parameters (`0x1600 + n-1`).
@@ -26,8 +81,11 @@ pub const TPDO_MAP_BASE: u16 = 0x1A00;
 
 /// COB-ID flag: PDO is invalid / not valid (bit 31).
 pub const COB_ID_INVALID: u32 = 1 << 31;
-/// COB-ID flag: RTR allowed on this COB-ID (bit 30).
-pub const COB_ID_RTR_ALLOWED: u32 = 1 << 30;
+/// COB-ID flag: RTR *not* allowed on this COB-ID (bit 30).
+///
+/// CiA 301 §7.4 / python-canopen `pdo/base.py:22-23`: bit 30 *set* forbids
+/// RTR on the PDO; a clear bit means RTR is allowed (BUGS.md 八H1).
+pub const COB_ID_RTR_NOT_ALLOWED: u32 = 1 << 30;
 
 /// Maximum total payload bits per PDO (one classic CAN frame).
 pub const MAX_PDO_BITS: usize = 64;
@@ -95,8 +153,8 @@ impl PdoMapping {
     /// Appends an entry after validating the cumulative length.
     ///
     /// # Errors
-    /// [`Error::MappingLengthExceeded`](crate::types::Error) when the total
-    /// exceeds [`MAX_PDO_BITS`].
+    /// [`Error::Other`](crate::types::Error) when the total exceeds
+    /// [`MAX_PDO_BITS`].
     pub fn push(&mut self, entry: MappingEntry) -> Result<()> {
         if self.total_bits + usize::from(entry.bit_length) > MAX_PDO_BITS {
             return Err(Error::Other("PDO mapping exceeds 64 bits"));
@@ -142,11 +200,22 @@ impl PdoMapping {
     /// - [`Error::ObjectDoesNotExist`] for missing targets;
     /// - [`Error::AccessDenied`] for non-mappable or access-incompatible
     ///   targets;
-    /// - [`Error::TypeMismatch`] when the declared type is too narrow.
+    /// - [`Error::TypeMismatch`] when the declared type is too narrow;
+    /// - [`Error::Other`] when two non-dummy entries target the same object
+    ///   (duplicate mapping).
     pub fn validate_against(&self, od: &ObjectDictionary, require_writable: bool) -> Result<()> {
+        // No two non-dummy entries may target the same object: pack/unpack
+        // would write the same bytes twice with undefined ordering
+        // (`BUGS.md` P2-6, docs/IMPLEMENTATION.md §7.3).
+        let mut seen = std::collections::BTreeSet::new();
         for entry in &self.entries {
             if entry.is_dummy() {
                 continue;
+            }
+            if !seen.insert(entry.address) {
+                return Err(Error::Other(
+                    "PDO mapping: duplicate mapping target address",
+                ));
             }
             let Some(od_entry) = od.entry(entry.address) else {
                 return Err(Error::ObjectDoesNotExist {
@@ -157,6 +226,7 @@ impl PdoMapping {
             if !od_entry.pdo_mappable {
                 return Err(Error::AccessDenied {
                     addr: entry.address,
+                    read: !require_writable,
                 });
             }
             let access_ok = if require_writable {
@@ -165,8 +235,11 @@ impl PdoMapping {
                 od_entry.access.is_readable()
             };
             if !access_ok {
+                // TPDO reads the object (require_writable=false is a TPDO);
+                // RPDO writes it.
                 return Err(Error::AccessDenied {
                     addr: entry.address,
+                    read: !require_writable,
                 });
             }
             let max_bits = match od_entry.data_type.fixed_size() {
@@ -179,6 +252,38 @@ impl PdoMapping {
                     expected: od_entry.data_type,
                     actual: od_entry.data_type,
                 });
+            }
+            // A signed type narrower than its declared width cannot be
+            // sign-extended on decode (the high bits would read as zero and
+            // negatives turn positive) — reject like most stacks do. Unsigned
+            // truncation stays legal (BUGS.md P2-1).
+            if let Some(full_bits) = od_entry.data_type.fixed_size().map(|n| n * 8) {
+                if od_entry.data_type.is_signed() && usize::from(entry.bit_length) != full_bits {
+                    return Err(Error::TypeMismatch {
+                        addr: entry.address,
+                        expected: od_entry.data_type,
+                        actual: od_entry.data_type,
+                    });
+                }
+                // BUGS.md M3: 浮点/时间类型不支持部分宽度映射——解包时
+                // `get_bits` 只填低位、高位补零，`decode_le` 会解出高位清零的
+                // 垃圾值并**无报错**写入 OD（签名整数已在此前拒绝）。仅允许完整
+                // 宽度（Bool 的 1 位子字节映射属正常用法，不在此列；Domain 是
+                // 变长类型，不进入此分支）。
+                let is_real_or_time = matches!(
+                    od_entry.data_type,
+                    DataType::Real32
+                        | DataType::Real64
+                        | DataType::TimeOfDay
+                        | DataType::TimeDifference
+                );
+                if is_real_or_time && usize::from(entry.bit_length) != full_bits {
+                    return Err(Error::TypeMismatch {
+                        addr: entry.address,
+                        expected: od_entry.data_type,
+                        actual: od_entry.data_type,
+                    });
+                }
             }
         }
         Ok(())
@@ -269,7 +374,16 @@ pub fn pack(mapping: &PdoMapping, od: &ObjectDictionary, buf: &mut [u8]) -> Resu
         let dt = od_entry.data_type;
         let mut tmp = [0u8; 8];
         let value = od.read(entry.address)?;
-        value.encode_as(dt, &mut tmp[..nbytes])?;
+        // Encode at the FULL declared width first (`encode_as` always writes
+        // exactly `fixed_size()` bytes), then let `put_bits` copy only the
+        // mapped bits. Encoding into a truncated `nbytes` slice failed for
+        // every legal unsigned sub-width mapping such as U16@8
+        // (BUGS.md R10-P1-6).
+        if dt.fixed_size().is_some() {
+            value.encode_as(dt, &mut tmp)?;
+        } else {
+            value.encode_as(dt, &mut tmp[..nbytes])?;
+        }
         put_bits(buf, bit_offset, &tmp, usize::from(entry.bit_length));
         bit_offset += usize::from(entry.bit_length);
     }
@@ -281,7 +395,9 @@ pub fn pack(mapping: &PdoMapping, od: &ObjectDictionary, buf: &mut [u8]) -> Resu
 ///
 /// # Errors
 /// - [`Error::BadLength`] when `data` is shorter than the mapping needs;
-/// - decode/write errors propagate verbatim.
+/// - the **first** decode/write error is returned after the remaining
+///   entries have still been applied — one broken entry must not discard
+///   the rest of the frame (`BUGS.md` H2).
 pub fn unpack(mapping: &PdoMapping, od: &mut ObjectDictionary, data: &[u8]) -> Result<()> {
     if data.len() < mapping.byte_len() {
         return Err(Error::BadLength {
@@ -290,27 +406,80 @@ pub fn unpack(mapping: &PdoMapping, od: &mut ObjectDictionary, data: &[u8]) -> R
         });
     }
     let mut bit_offset = 0usize;
+    let mut first_err: Option<Error> = None;
     for entry in mapping.entries() {
         let bits = usize::from(entry.bit_length);
         if !entry.is_dummy() {
             let nbytes = bits.div_ceil(8);
             let mut tmp = [0u8; 8];
             get_bits(data, bit_offset, &mut tmp, bits);
-            // Decode against the *current* declared type of the target.
-            if let Some(od_entry) = od.entry(entry.address) {
+            // Decode against the *current* declared type of the target. For
+            // fixed-width types decode from the FULL width: `get_bits` only
+            // fills the low `bits` bits and the rest of `tmp` is zero, which
+            // is exactly the zero-extension a narrow unsigned mapping means
+            // (U16@8 previously demanded an impossible 1-byte buffer,
+            // BUGS.md R10-P1-6).
+            let result = (|| -> Result<()> {
+                let Some(od_entry) = od.entry(entry.address) else {
+                    return Err(Error::ObjectDoesNotExist {
+                        index: entry.address.index,
+                        subindex: entry.address.subindex,
+                    });
+                };
                 let dt = od_entry.data_type;
-                let value = Value::decode_le(dt, &tmp[..nbytes])?;
-                od.write(entry.address, value)?;
-            } else {
-                return Err(Error::ObjectDoesNotExist {
-                    index: entry.address.index,
-                    subindex: entry.address.subindex,
-                });
+                let use_len = dt.fixed_size().unwrap_or(nbytes).min(8);
+                let value = Value::decode_le(dt, &tmp[..use_len])?;
+                // BUGS.md M3: a partial-width mapping (fewer bits than the
+                // object's full width, e.g. U16@8) must merge into the
+                // existing value instead of overwriting it — decoding from
+                // the full width zero-extends the unmapped high bits, so a
+                // wholesale write would clobber them on every reception.
+                let full_bits = dt.fixed_size().map_or(bits, |n| n * 8);
+                let merged = if bits < full_bits {
+                    match (&value, od_entry.raw_read(entry.address)?) {
+                        (Value::Uint(inc), Value::Uint(cur)) => {
+                            // BUGS.md L4: `bits` 受 `bits < full_bits` 门控必
+                            // 小于 64，此处仍显式避免 64 位移位 UB。
+                            let mask = if bits >= 64 {
+                                u64::MAX
+                            } else {
+                                (1u64 << bits) - 1
+                            };
+                            Value::Uint((cur & !mask) | (*inc & mask))
+                        }
+                        (Value::Int(inc), Value::Int(cur)) => {
+                            // Two's-complement bit merge; signed partial
+                            // mappings are rejected by `validate_against`,
+                            // this arm is defensive only.
+                            let mask = if bits >= 64 {
+                                u64::MAX
+                            } else {
+                                (1u64 << bits) - 1
+                            };
+                            Value::Int(((cur as u64 & !mask) | (*inc as u64 & mask)) as i64)
+                        }
+                        _ => value, // Bool/Real/Str/Bytes have no mergeable bits
+                    }
+                } else {
+                    value
+                };
+                od.write(entry.address, merged)?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                // Remember the first failure but keep applying the other
+                // entries of this frame (`BUGS.md` H2).
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
         bit_offset += bits;
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Transmission types (CiA 301 §7.4.3); values 241..=251 are reserved and
@@ -357,7 +526,15 @@ impl TransmissionType {
         }
     }
 
-    /// Whether this TPDO type transmits upon SYNC frames.
+    /// Whether this TPDO type transmits **upon SYNC frames** — the trigger
+    /// used by the synchronous scheduling loop.
+    ///
+    /// Note (`BUGS.md` H2): CiA 301 §7.4.3 groups type 252 (RtrOnlySync)
+    /// under "synchronous" because its *sample* is the last SYNC value, but
+    /// its *transmission trigger* is a remote request, not the SYNC frame —
+    /// so it deliberately returns `false` here and is serviced separately
+    /// via `on_remote_request` (which requires the first SYNC of the
+    /// session before answering).
     #[must_use]
     pub const fn is_synchronous(self) -> bool {
         matches!(self, Self::SyncAcyclic | Self::SyncCyclic(_))
@@ -393,11 +570,14 @@ pub struct PdoConfig {
 
 impl PdoConfig {
     /// Reads a communication record; sub 1 (COB-ID) is mandatory, subs 2..6
-    /// default to zero when absent (permissive for minimal devices).
+    /// default to zero when absent (permissive for minimal devices) — with
+    /// one deliberate exception: sub 2 (transmission type) falls back to
+    /// `tt_default`, which the caller supplies per direction (RPDO → 0 =
+    /// synchronous, TPDO → 254 = event-driven; CiA 301 `BUGS.md` R10-P2-12).
     ///
     /// # Errors
     /// Propagates OD errors for missing mandatory fields.
-    pub fn from_od(od: &ObjectDictionary, comm_index: u16) -> Result<Self> {
+    pub fn from_od(od: &ObjectDictionary, comm_index: u16, tt_default: u8) -> Result<Self> {
         let Value::Uint(cob_id_raw) = od.read(Address::new(comm_index, 1))? else {
             return Err(Error::TypeMismatch {
                 addr: Address::new(comm_index, 1),
@@ -408,13 +588,31 @@ impl PdoConfig {
         let read_u16 = |sub: u8| -> Result<u16> {
             match od.read(Address::new(comm_index, sub)) {
                 Ok(Value::Uint(v)) => Ok(v as u16),
-                Ok(_) => Ok(0),
+                // 错误类型显式报错（与 sub 2 的 `TypeMismatch` 行为一致，
+                // BUGS.md P2-2），而非静默降级为 0；缺失（Err）仍按 0 默认。
+                Ok(other) => Err(Error::TypeMismatch {
+                    addr: Address::new(comm_index, sub),
+                    expected: DataType::Unsigned16,
+                    actual: other.data_type(),
+                }),
                 Err(_) => Ok(0),
             }
         };
+        // Missing sub 2 adopts the caller's direction default; an *invalid*
+        // value (reserved band 241..=251) still flows through
+        // `transmission_type()` as an error at the caller; a present-but-
+        // wrongly-typed sub 2 is a configuration error, not a silent default
+        // (BUGS.md #29).
         let tt = match od.read(Address::new(comm_index, 2)) {
             Ok(Value::Uint(v)) => v as u8,
-            _ => 254,
+            Err(_) => tt_default,
+            Ok(_) => {
+                return Err(Error::TypeMismatch {
+                    addr: Address::new(comm_index, 2),
+                    expected: DataType::Unsigned8,
+                    actual: DataType::Unsigned8,
+                })
+            }
         };
         Ok(Self {
             cob_id_raw: cob_id_raw as u32,
@@ -434,10 +632,11 @@ impl PdoConfig {
         self.cob_id_raw & COB_ID_INVALID == 0
     }
 
-    /// Whether remote requests are allowed on this COB-ID.
+    /// Whether remote requests are allowed on this COB-ID (CiA 301 §7.4:
+    /// bit 30 *clear* allows RTR, *set* forbids it — BUGS.md 八H1).
     #[must_use]
     pub const fn rtr_allowed(&self) -> bool {
-        self.cob_id_raw & COB_ID_RTR_ALLOWED != 0
+        self.cob_id_raw & COB_ID_RTR_NOT_ALLOWED == 0
     }
 
     /// The 11-bit CAN identifier.
@@ -582,6 +781,61 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_real_partial_width_mapping() {
+        // BUGS.md M3：浮点/时间类型不支持部分宽度映射——解包时 `get_bits`
+        // 只填低位、高位补零，`decode_le` 会解出高位清零的垃圾值并**无报错**
+        // 写入 OD。完整宽度（32/64 位）仍合法，部分宽度（如 REAL32@16）被拒绝。
+        let mut od = test_od();
+        let mk = |dt, val| Entry::new("", dt, AccessType::Rw, Storage::Value(val)).pdo_mappable();
+        od.insert(
+            Address::new(0x6003, 1),
+            mk(DataType::Real32, Value::Real(1.0)),
+        );
+        od.insert(
+            Address::new(0x6004, 1),
+            mk(DataType::TimeOfDay, Value::Bytes(vec![1, 2, 3, 4, 5, 6])),
+        );
+
+        // REAL32@16（部分宽度）→ 拒绝。
+        let partial = mapping(&[(Address::new(0x6003, 1), 16)]);
+        assert!(partial.validate_against(&od, false).is_err());
+
+        // REAL32@32（完整宽度）→ 合法。
+        let full = mapping(&[(Address::new(0x6003, 1), 32)]);
+        assert!(full.validate_against(&od, false).is_ok());
+
+        // TIME_OF_DAY@24（部分宽度）→ 拒绝。
+        let partial_time = mapping(&[(Address::new(0x6004, 1), 24)]);
+        assert!(partial_time.validate_against(&od, false).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_signed_partial_width_mapping() {
+        // BUGS.md P2-1: a signed type mapped at less than its declared width
+        // cannot be sign-extended on decode (narrow field would read as
+        // positive), so `validate_against` rejects it — unsigned truncation
+        // stays legal.
+        let mut od = test_od();
+        let mk = |dt, val| Entry::new("", dt, AccessType::Rw, Storage::Value(val)).pdo_mappable();
+        od.insert(
+            Address::new(0x6002, 1),
+            mk(DataType::Integer16, Value::Int(-1)),
+        );
+
+        // Full-width INTEGER16: fine.
+        let full = mapping(&[(Address::new(0x6002, 1), 16)]);
+        assert!(full.validate_against(&od, false).is_ok());
+
+        // 9-bit slice of a signed type: rejected.
+        let narrow = mapping(&[(Address::new(0x6002, 1), 9)]);
+        assert!(narrow.validate_against(&od, false).is_err());
+
+        // Unsigned truncation to 9 bits remains legal.
+        let trunc = mapping(&[(Address::new(0x6000, 2), 9)]);
+        assert!(trunc.validate_against(&od, false).is_ok());
+    }
+
+    #[test]
     fn pack_matches_known_layout() {
         let od = test_od();
         let m = mapping(&[
@@ -619,6 +873,50 @@ mod tests {
         assert_eq!(
             od.read(Address::new(0x6000, 2)).unwrap(),
             Value::Uint(0x3322)
+        );
+    }
+
+    #[test]
+    fn unpack_continues_after_a_broken_entry() {
+        // BUGS.md H2: one failing entry must not discard the rest of the
+        // frame — the first error is reported, but the remaining entries are
+        // still applied. Previously the `?` early-returned and 0x6000:2 was
+        // left stale.
+        let mut od = test_od();
+        let m = mapping(&[
+            (Address::new(0x2000, 0), 8), // no such object in `test_od`
+            (Address::new(0x6000, 1), 8),
+        ]);
+        let err = unpack(&m, &mut od, &[0x11, 0x22]).unwrap_err();
+        assert!(matches!(err, Error::ObjectDoesNotExist { .. }));
+        // The healthy entry after the broken one was still written.
+        assert_eq!(od.read(Address::new(0x6000, 1)).unwrap(), Value::Uint(0x22));
+    }
+
+    #[test]
+    fn partial_width_unpack_preserves_unmapped_high_bits() {
+        // BUGS.md M3: a U16@8 mapping must merge into the existing value —
+        // the previous decode-and-overwrite zeroed the unmapped high byte on
+        // every reception.
+        let mut od = test_od();
+        od.write(Address::new(0x6000, 2), Value::Uint(0xBEEF))
+            .unwrap();
+        let m = mapping(&[(Address::new(0x6000, 2), 8)]);
+        unpack(&m, &mut od, &[0x12]).unwrap();
+        // High byte 0xBE survives; only the mapped low byte is replaced.
+        assert_eq!(
+            od.read(Address::new(0x6000, 2)).unwrap(),
+            Value::Uint(0xBE12)
+        );
+
+        // A wider partial mapping (U32@16) keeps the top 16 bits too.
+        od.write(Address::new(0x6000, 3), Value::Uint(0xDEAD_BEEF))
+            .unwrap();
+        let m = mapping(&[(Address::new(0x6000, 3), 16)]);
+        unpack(&m, &mut od, &[0x12, 0x34]).unwrap();
+        assert_eq!(
+            od.read(Address::new(0x6000, 3)).unwrap(),
+            Value::Uint(0xDEAD_3412)
         );
     }
 
@@ -672,8 +970,8 @@ mod tests {
     #[test]
     fn config_reads_comm_record_with_defaults() {
         let od = StandardObjects::new().build();
-        // Minimal record: only COB-ID present.
-        let cfg = PdoConfig::from_od(&od, 0x1800).unwrap_or(PdoConfig {
+        // Minimal record: only COB-ID present. TPDO direction → default 254.
+        let cfg = PdoConfig::from_od(&od, 0x1800, 254).unwrap_or(PdoConfig {
             cob_id_raw: 0,
             transmission_type_raw: 254,
             inhibit_time_100us: 0,
@@ -712,7 +1010,7 @@ mod tests {
             Value::Uint(1000),
             DataType::Unsigned16,
         );
-        let cfg = PdoConfig::from_od(&od2, 0x1800).unwrap();
+        let cfg = PdoConfig::from_od(&od2, 0x1800, 254).unwrap();
         assert!(!cfg.is_valid());
         assert_eq!(cfg.cob_id(), 0x305);
         assert_eq!(cfg.inhibit_time_100us, 25);
@@ -726,5 +1024,45 @@ mod tests {
         assert_eq!(default_cob_id(false, 4, n), Some(0x505));
         assert_eq!(default_cob_id(true, 5, n), None);
         assert_eq!(default_cob_id(false, 0, n), None);
+    }
+
+    /// BUGS.md P2-2：`from_od` 的 `read_u16` 对错误类型（非 Uint）的 sub 3/5
+    /// 应显式 `TypeMismatch`，而非静默降级为 0（与 sub 2 行为一致）。
+    #[test]
+    fn p2_2_from_od_rejects_wrong_typed_sub() {
+        let mut od = test_od();
+        od.insert(
+            Address::new(0x1800, 1),
+            Entry::new(
+                "",
+                DataType::Unsigned32,
+                AccessType::Rw,
+                Storage::Value(Value::Uint(0x185)),
+            ),
+        );
+        od.insert(
+            Address::new(0x1800, 2),
+            Entry::new(
+                "",
+                DataType::Unsigned8,
+                AccessType::Rw,
+                Storage::Value(Value::Uint(254)),
+            ),
+        );
+        // sub 5（event timer）误设为 Boolean —— 应报错而非静默 0。
+        od.insert(
+            Address::new(0x1800, 5),
+            Entry::new(
+                "",
+                DataType::Boolean,
+                AccessType::Rw,
+                Storage::Value(Value::Bool(true)),
+            ),
+        );
+        let err = PdoConfig::from_od(&od, 0x1800, 254).unwrap_err();
+        assert!(
+            matches!(err, Error::TypeMismatch { .. }),
+            "非 Uint 的 sub5 应报 TypeMismatch，实际 {err:?}"
+        );
     }
 }

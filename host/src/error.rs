@@ -15,12 +15,31 @@ pub enum HostError {
     /// The remote SDO server aborted the transaction.
     #[error("SDO aborted: {0}")]
     SdoAborted(canopen_core::sdo::SdoAbortCode),
-    /// Protocol violation while driving a transaction.
-    #[error("{0}")]
-    Protocol(&'static str),
+    /// COB-ID does not fit the 11-bit classic CAN identifier space.
+    #[error("COB-ID exceeds 11 bits")]
+    BadCobId,
+    /// Payload exceeds the 8-byte classic CAN frame limit.
+    #[error("payload exceeds 8 bytes")]
+    BadPayloadLen,
+    /// NMT target node id is outside the valid 0..=127 range.
+    #[error("NMT target must be 0..=127")]
+    BadNmtTarget,
+    /// SDO node id is outside the valid 1..=127 range (0 is never a valid
+    /// SDO peer).
+    #[error("SDO node id must be 1..=127")]
+    BadSdoNode,
+    /// The transaction ended without the expected terminal event (e.g. a
+    /// read that finished without a value, or a write without confirmation).
+    #[error("transaction ended without the expected terminal event")]
+    ProtocolIncomplete,
     /// Core protocol error (decode failures etc.).
     #[error(transparent)]
     Core(#[from] canopen_core::types::Error),
+    /// EDS content error surfaced separately from core protocol errors so
+    /// callers can tell a device-side EDS problem (out-of-range default,
+    /// bad length, …) from a network/protocol failure (`BUGS.md` H2).
+    #[error("EDS content error: {0}")]
+    Eds(canopen_core::types::Error),
     /// The network RX thread died (panic or fatal IO).
     #[error("network RX thread failed: {0}")]
     Rx(String),

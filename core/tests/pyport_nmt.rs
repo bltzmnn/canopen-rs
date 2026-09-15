@@ -1,5 +1,11 @@
 //! Port of `ref/canopen/test/test_nmt.py` subsets — NMT master/slave
 //! interactions over the virtual bus (docs/EXTENSIONS.md 批次 D P-c).
+//!
+//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! python-canopen's suite and are **not** re-checked by `cargo test` against
+//! `ref/`. After touching any codec, run
+//! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the
+//! transcription against the reference implementation.
 
 use canopen_core::datatypes::Value;
 use canopen_core::nmt::{
@@ -121,10 +127,17 @@ fn wait_for_bootup_via_consumer_events() {
     let events = bus.run(4, 0); // 200 ms
     assert!(events.iter().any(|e| matches!(e, HbEvent::Started { .. })));
 
-    // Reset communication → slave re-initialises → re-boot → its boot-up
-    // frame (state byte 0x00) reaches the master's consumer.
-    bus.send_nmt(NmtCommand::ResetCommunication, Some(SLAVE_A));
-    let tx = bus.node(SLAVE_A).boot().unwrap();
+    // Reset communication → slave re-initialises → re-boots automatically
+    // (BUGS.md H2): the reset hand-back IS the boot-up frame (state 0x00)
+    // which reaches the master's consumer.
+    let reset_out = bus.node(SLAVE_A).on_frame(
+        0x000,
+        &encode_command(
+            NmtCommand::ResetCommunication,
+            Some(NodeId::new(SLAVE_A).unwrap()),
+        ),
+    );
+    let tx = reset_out.into_iter().next().expect("reset re-boots");
     assert_eq!(tx.payload(), &[0x00]);
     let events = bus
         .hb

@@ -89,6 +89,22 @@ impl DataType {
         self.fixed_size().is_none()
     }
 
+    /// Whether this is a signed integer type (`INTEGERn`).
+    #[must_use]
+    pub const fn is_signed(self) -> bool {
+        matches!(
+            self,
+            Self::Integer8
+                | Self::Integer16
+                | Self::Integer24
+                | Self::Integer32
+                | Self::Integer40
+                | Self::Integer48
+                | Self::Integer56
+                | Self::Integer64
+        )
+    }
+
     /// Looks up a type by its CiA 301 index.
     #[must_use]
     pub fn from_index(index: u16) -> Option<Self> {
@@ -158,6 +174,12 @@ impl fmt::Display for DataType {
     }
 }
 
+/// Upper bound for variable-length values (VisibleString / OctetString /
+/// UnicodeString / Domain), matching docs/IMPLEMENTATION.md §3.2. Decoding
+/// and SDO segmented download enforce this so peers cannot grow buffers
+/// without bound (`BUGS.md` P2-15).
+pub const MAX_VALUE_LEN: usize = 65535;
+
 /// A typed value, as stored in an object dictionary entry or transferred
 /// over SDO/PDO.
 ///
@@ -197,6 +219,21 @@ impl Value {
             Value::Str(s) => s.len(),
             Value::Bytes(b) => b.len(),
         }
+    }
+
+    /// Number of bytes [`Value::encode_as`] writes for the given target
+    /// type. Mostly identical to [`Value::encoded_len`], except when the
+    /// target's wire representation is wider than the value's minimal one —
+    /// currently only UNICODE_STRING, whose UTF-16LE encoding doubles (or
+    /// more) a Rust `Str` (`BUGS.md` L7).
+    #[must_use]
+    pub fn encoded_len_as(&self, dt: DataType) -> usize {
+        if dt == DataType::UnicodeString {
+            if let Value::Str(s) = self {
+                return s.encode_utf16().count() * 2;
+            }
+        }
+        self.encoded_len()
     }
 
     /// The default data type this value would be stored as.
@@ -271,6 +308,11 @@ impl Value {
                 DataType::Boolean => write_fixed(buf, &[u8::from(*b)]),
                 _ => Err(type_mismatch(dt, self)),
             },
+            Value::Uint(b @ (0 | 1)) if dt == DataType::Boolean => {
+                // python-canopen accepts integer 0/1 for BOOLEAN (BUGS.md
+                // P3-36); keep the pyport surface equally lenient.
+                write_fixed(buf, &[*b as u8])
+            }
             Value::Int(v) => {
                 if !matches!(
                     dt,
@@ -321,6 +363,21 @@ impl Value {
             },
             Value::Str(s) => match dt {
                 DataType::VisibleString => write_fixed(buf, s.as_bytes()),
+                // CiA 306 / python-canopen `encode_raw`: UNICODE_STRING is
+                // UTF-16LE on the wire (BUGS.md L7). Previously the Rust
+                // string was written as UTF-8 bytes, which python-canopen
+                // decodes as UTF-16LE — corrupting every non-ASCII
+                // character exchanged with it. Callers must size `buf` with
+                // [`Value::encoded_len_as`] (the UTF-16LE form is wider).
+                DataType::UnicodeString => {
+                    let mut tmp = [0u8; 2];
+                    let mut written = 0usize;
+                    for unit in s.encode_utf16() {
+                        tmp.copy_from_slice(&unit.to_le_bytes());
+                        written += write_fixed(&mut buf[written..], &tmp)?;
+                    }
+                    Ok(written)
+                }
                 _ => Err(type_mismatch(dt, self)),
             },
             Value::Bytes(b) => match dt {
@@ -348,7 +405,8 @@ impl Value {
     /// Decodes a value of type `dt` from little-endian `bytes`.
     ///
     /// Fixed-size types require `bytes.len()` to equal
-    /// [`DataType::fixed_size`]; variable-length types accept any length.
+    /// [`DataType::fixed_size`]; variable-length types accept any length up
+    /// to [`MAX_VALUE_LEN`].
     pub fn decode_le(dt: DataType, bytes: &[u8]) -> Result<Self> {
         if let Some(size) = dt.fixed_size() {
             if bytes.len() != size {
@@ -357,6 +415,13 @@ impl Value {
                     actual: bytes.len(),
                 });
             }
+        } else if bytes.len() > MAX_VALUE_LEN {
+            // Variable-length types are capped so a misbehaving peer cannot
+            // grow transfer buffers without bound (BUGS.md P2-15).
+            return Err(Error::BadLength {
+                declared: MAX_VALUE_LEN,
+                actual: bytes.len(),
+            });
         }
         Ok(match dt {
             DataType::Boolean => Value::Bool(bytes[0] != 0),
@@ -382,6 +447,9 @@ impl Value {
             DataType::Real64 => Value::Real(f64::from_le_bytes(
                 bytes.try_into().expect("length checked above"),
             )),
+            // CiA 306 declares VisibleString ASCII; bytes above 0x7F are
+            // replaced per Rust's from_utf8_lossy and do not survive a
+            // round trip — documented behaviour (`BUGS.md` R10-P2-13).
             DataType::VisibleString => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
             DataType::OctetString
             | DataType::UnicodeString
@@ -492,7 +560,11 @@ fn write_le_n(buf: &mut [u8], le_bytes: &[u8; 8], n: usize) -> Result<usize> {
     Ok(n)
 }
 
-/// Truncates an f64 into f32 bit pattern (infinity on overflow).
+/// Truncates an f64 into f32 bit pattern.
+///
+/// Values beyond the f32 range silently saturate to ±infinity and NaN is
+/// preserved — Rust's `as` semantics, matching CANopenNode's implicit
+/// conversion (`BUGS.md` P3-35).
 fn trunc_real32(r: f64) -> u32 {
     (r as f32).to_bits()
 }
@@ -708,6 +780,35 @@ mod tests {
         let b = Value::Bytes(vec![0x01, 0x02, 0xFE]);
         assert_eq!(b.encode_as(DataType::Domain, &mut buf).unwrap(), 3);
         assert_eq!(Value::decode_le(DataType::Domain, &buf[..3]).unwrap(), b);
+    }
+
+    #[test]
+    fn unicode_string_encodes_utf16le_like_python_canopen() {
+        // BUGS.md L7: UNICODE_STRING is UTF-16LE on the wire (CiA 306,
+        // python-canopen `encode_raw` → `utf_16_le`); a Rust `Str` must be
+        // transcoded, not written as UTF-8 bytes (which python-canopen
+        // would decode as UTF-16LE, corrupting non-ASCII characters).
+        let mut buf = [0u8; 64];
+        let s = Value::Str("hé".into());
+        // é is U+00E9 → UTF-16LE 0xE9 0x00.
+        let n = s.encode_as(DataType::UnicodeString, &mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..n], &[b'h', 0x00, 0xE9, 0x00]);
+        // The minimal-length form differs from the UTF-8 byte count.
+        assert_eq!(s.encoded_len(), 3);
+        assert_eq!(s.encoded_len_as(DataType::UnicodeString), 4);
+
+        // Multi-byte (astral) code point: U+1F600 → surrogate pair.
+        let emoji = Value::Str("😀".into());
+        let n = emoji.encode_as(DataType::UnicodeString, &mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..n], &[0x3D, 0xD8, 0x00, 0xDE]); // UTF-16LE of D83D DE00
+
+        // Raw bytes pass through verbatim (EDS hex defaults etc.).
+        let raw = Value::Bytes(vec![0x41, 0x00, 0x42, 0x00]);
+        let n = raw.encode_as(DataType::UnicodeString, &mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..n], &[0x41, 0x00, 0x42, 0x00]);
     }
 
     #[test]

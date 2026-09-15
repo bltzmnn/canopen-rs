@@ -6,14 +6,14 @@
 //! [1] 4 read 0x1017 0 u16        →  [1] OK | 500
 //! [1] 4 write 0x1017 0 u16 500   →  [1] OK
 //! [1] start node 4               →  [1] OK
-//! [1] set sdo_timeout 500        →  [1] OK
+//! [1] set node 5                  →  [1] OK
 //! ```
 //!
 //! Every request/response line is framed by `[<sequence>] … <CR><LF>`.
 //! Responses are `OK`, a bare value, or `ERROR:<code>` where the code is
-//! either an SDO abort code (hex) or one of the CiA numeric error codes:
-//! 100 syntax error, 101 unsupported object, 200 NMT/HB failure,
-//! 300 timeout / CAN failure.
+//! either an SDO abort code (hex) or one of the CiA 309-3 numeric codes:
+//! 100 request not supported, 101 syntax error, 102 request not processed
+//! due to internal state, 103 time-out (`CO_gateway_ascii.h:154-183`).
 //!
 //! The module is transport-free: [`Gateway::feed_line`] consumes one ASCII
 //! line and returns the exact response bytes to write back. Executing SDO/
@@ -23,19 +23,22 @@ use crate::datatypes::{DataType, Value};
 use crate::nmt::NmtCommand;
 use crate::sdo::SdoAbortCode;
 
-/// Numeric gateway error codes (CiA 309-3 subset).
+/// Numeric gateway error codes (CiA 309-3 subset, `CO_gateway_ascii.h:154-183`).
+///
+/// The numeric values follow CiA 309-3 exactly:
+/// `100` request not supported, `101` syntax error, `102` not processed due
+/// to internal state, `103` time-out. SDO failures are transmitted as their
+/// abort code in hex (`ERROR:0x…`), never folded into a numeric code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayErrorCode {
-    /// Syntax or value out of range.
-    Syntax = 100,
-    /// Unsupported feature requested.
-    UnsupportedObject = 101,
-    /// NMT command failed.
-    NmtFailed = 200,
-    /// SDO timeout.
-    Timeout = 300,
-    /// Generic CAN failure.
-    CanFailed = 301,
+    /// Unknown command / unsupported feature (CiA 309-3 `100`).
+    RequestNotSupported = 100,
+    /// Malformed request or out-of-range literal (CiA 309-3 `101`).
+    Syntax = 101,
+    /// Valid request that could not be executed (CiA 309-3 `102`).
+    InternalState = 102,
+    /// Operation timed out locally (CiA 309-3 `103`).
+    Timeout = 103,
 }
 
 impl GatewayErrorCode {
@@ -215,9 +218,8 @@ impl Gateway {
 
     /// Feeds one complete input line (without line terminator).
     ///
-    /// # Errors
     /// Never fails: malformed lines become [`GatewayEvent::Respond`] with an
-    /// `ERROR:100` frame.
+    /// `ERROR:101` (CiA 309-3 syntax error) frame.
     #[must_use]
     pub fn feed_line(&mut self, line: &str) -> GatewayEvent {
         let trimmed = line.trim();
@@ -233,7 +235,12 @@ impl Gateway {
         };
         let seq = &rest[..close];
         let Ok(seq_num) = seq.parse::<u32>() else {
-            return GatewayEvent::Respond(format!("[{seq}] ERROR:100"));
+            // BUGS.md 八L5: an unparseable sequence must not be echoed back
+            // as a garbage token. CANopenNode (`CO_gateway_ascii.c:633-635`)
+            // answers with its last valid sequence number (0 right after
+            // reset); the frameless branch below already answers `[0]` — do
+            // the same here.
+            return self.frameless_error();
         };
         let body = rest[close + 1..].trim();
         match self.parse_request(body) {
@@ -246,11 +253,24 @@ impl Gateway {
     }
 
     fn frameless_error(&self) -> GatewayEvent {
-        GatewayEvent::Respond("ERROR:100".to_string())
+        // CiA 309-3 frames always answer with a sequence number; requests
+        // whose `[seq]` header is missing/unparseable answer with seq 0
+        // so the client's pending request can time out against something
+        // (`BUGS.md` P3-9). Missing framing is a syntax error (101).
+        GatewayEvent::Respond(format!("[0] ERROR:{}", GatewayErrorCode::Syntax.code()))
     }
 
     /// Parses the request body after the `[seq]` prefix.
     fn parse_request(&mut self, body: &str) -> Result<GatewayAction, GatewayErrorCode> {
+        // CiA 309-3 (§5.4): a `#` comment may follow the command string
+        // (`CO_gateway_ascii.c:170-171`). Strip an inline comment *token*
+        // (`# ...`) before tokenising — a `#` glued to a value like
+        // `vs a#b` stays part of the value (BUGS.md #30).
+        let body = body
+            .split_whitespace()
+            .take_while(|t| !t.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut tokens = body.split_whitespace();
         let first = tokens.next().ok_or(GatewayErrorCode::Syntax)?;
 
@@ -264,12 +284,15 @@ impl Gateway {
 
         match verb {
             "read" => {
-                let node = self.resolve_node(node_token)?;
+                let node = self.reject_broadcast(self.resolve_node(node_token)?)?;
                 let index = parse_index(tokens.next().ok_or(GatewayErrorCode::Syntax)?)?;
                 let sub = tokens.next().map_or(Ok(0), parse_sub)?;
                 let ty = tokens.next().map_or(Ok(GwDataType::Uint(32)), |t| {
                     GwDataType::parse(t).ok_or(GatewayErrorCode::Syntax)
                 })?;
+                if tokens.next().is_some() {
+                    return Err(GatewayErrorCode::Syntax); // trailing junk
+                }
                 Ok(GatewayAction::Read {
                     node,
                     index,
@@ -278,7 +301,7 @@ impl Gateway {
                 })
             }
             "write" => {
-                let node = self.resolve_node(node_token)?;
+                let node = self.reject_broadcast(self.resolve_node(node_token)?)?;
                 let index = parse_index(tokens.next().ok_or(GatewayErrorCode::Syntax)?)?;
                 let sub = tokens.next().map_or(Ok(0), parse_sub)?;
                 let ty_tok = tokens.next().ok_or(GatewayErrorCode::Syntax)?;
@@ -295,6 +318,11 @@ impl Gateway {
             }
             "start" | "stop" | "preop" => {
                 let node = self.nmt_target(node_token, &mut tokens)?;
+                // NMT verbs take no further arguments — reject trailing
+                // tokens instead of silently swallowing them (BUGS.md #30).
+                if tokens.next().is_some() {
+                    return Err(GatewayErrorCode::Syntax);
+                }
                 let command = match verb {
                     "start" => GatewayNmt::Start,
                     "stop" => GatewayNmt::Stop,
@@ -305,6 +333,9 @@ impl Gateway {
             "reset" => {
                 let mode = tokens.next().ok_or(GatewayErrorCode::Syntax)?;
                 let node = self.nmt_target(node_token, &mut tokens)?;
+                if tokens.next().is_some() {
+                    return Err(GatewayErrorCode::Syntax);
+                }
                 let command = match mode {
                     "node" => GatewayNmt::ResetNode,
                     "comm" => GatewayNmt::ResetCommunication,
@@ -313,6 +344,12 @@ impl Gateway {
                 Ok(GatewayAction::Nmt { command, node })
             }
             "set" => {
+                // `set` is a configuration verb, not an NMT target — a
+                // leading node id ("4 set node 5") is a syntax error, not a
+                // silently dropped token (BUGS.md #30).
+                if node_token.is_some() {
+                    return Err(GatewayErrorCode::Syntax);
+                }
                 let key = tokens.next().ok_or(GatewayErrorCode::Syntax)?;
                 let val = tokens.next().ok_or(GatewayErrorCode::Syntax)?;
                 match key {
@@ -324,11 +361,13 @@ impl Gateway {
                         self.default_node = Some(n);
                         Ok(GatewayAction::SetNode(n))
                     }
-                    _ => Err(GatewayErrorCode::UnsupportedObject),
+                    _ => Err(GatewayErrorCode::RequestNotSupported),
                 }
             }
-            "help" | "led" | "log" => Err(GatewayErrorCode::UnsupportedObject),
-            _ => Err(GatewayErrorCode::Syntax),
+            "help" | "led" | "log" => Err(GatewayErrorCode::RequestNotSupported),
+            // Unknown verb: CANopenNode answers `100` (request not
+            // supported) — `CO_gateway_ascii.c:1531`.
+            _ => Err(GatewayErrorCode::RequestNotSupported),
         }
     }
 
@@ -349,13 +388,23 @@ impl Gateway {
         }
     }
 
+    /// SDO verbs have no broadcast semantics: node 0 is only valid for NMT.
+    fn reject_broadcast(&self, node: u8) -> Result<u8, GatewayErrorCode> {
+        if node == 0 {
+            return Err(GatewayErrorCode::Syntax);
+        }
+        Ok(node)
+    }
+
     fn resolve_node(&self, token: Option<&str>) -> Result<u8, GatewayErrorCode> {
         match token {
             Some(t) => t
                 .parse::<u8>()
                 .map_err(|_| GatewayErrorCode::Syntax)
                 .and_then(|n| {
-                    (1..=127)
+                    // 0 = broadcast: valid for NMT verbs only. SDO verbs
+                    // reject it later when building their action.
+                    (0..=127)
                         .contains(&n)
                         .then_some(n)
                         .ok_or(GatewayErrorCode::Syntax)
@@ -371,9 +420,21 @@ impl Gateway {
     }
 
     /// `[<seq>] <value>`
+    ///
+    /// Strings are printed verbatim (CiA 309-3 readback has no surrounding
+    /// quotes; the `Value` Display uses Debug-quoting for them).
     #[must_use]
     pub fn format_value(sequence: u32, value: &Value) -> String {
-        format!("[{sequence}] {value}")
+        match value {
+            // CR/LF inside a string would break the line-framed protocol
+            // and let a stored value forge response lines — escape them so
+            // the readback stays single-line (BUGS.md #30).
+            Value::Str(s) => {
+                let escaped = s.replace('\r', "\\r").replace('\n', "\\n");
+                format!("[{sequence}] {escaped}")
+            }
+            other => format!("[{sequence}] {other}"),
+        }
     }
 
     /// `[<seq>] ERROR:<code>` — numeric CiA code or hex SDO abort.
@@ -415,20 +476,34 @@ fn parse_sub(tok: &str) -> Result<u8, GatewayErrorCode> {
 pub fn encode_payload(ty: GwDataType, raw: &str) -> Option<Vec<u8>> {
     match ty {
         GwDataType::Bool => {
-            let n = raw.parse::<u8>().ok()?;
-            Some(vec![u8::from(n != 0)])
+            // Strict boolean literals only (BUGS.md P3-46): "2" is a syntax
+            // error, not `true`.
+            match raw.trim() {
+                "0" | "false" => Some(vec![0]),
+                "1" | "true" => Some(vec![1]),
+                _ => None,
+            }
         }
         GwDataType::Str => Some(raw.as_bytes().to_vec()),
         GwDataType::Int(w) | GwDataType::Uint(w) => {
-            let signed_int = raw.parse::<i64>().ok()?;
-            let unsigned = raw.parse::<u64>().ok();
-            let mut buf = [0u8; 8];
-            let n = match ty {
-                GwDataType::Int(_) => Value::Int(signed_int).encode_le(&mut buf).ok()?,
-                _ => Value::Uint(unsigned?).encode_le(&mut buf).ok()?,
+            // Encode at the *declared* width via `encode_as` so negatives
+            // sign-extend (encode_le + zero-padding corrupted e.g. `i16 -1`
+            // into 0xFF00 = +255, BUGS.md #1). Out-of-range literals are a
+            // gateway-level syntax error, not something to ship and let the
+            // remote abort on length (BUGS.md R10-P2-10).
+            let Some(dt) = ty.to_core() else {
+                return None; // parse() only yields 8/16/32/64 widths
             };
             let width = usize::from(w / 8);
-            Some(buf[..width.max(n)].to_vec())
+            let mut buf = [0u8; 8];
+            let value = match ty {
+                GwDataType::Int(_) => Value::Int(raw.parse::<i64>().ok()?),
+                // u64 directly: `u64::MAX` must be writable, an i64 parse
+                // would reject it (BUGS.md #30).
+                _ => Value::Uint(raw.parse::<u64>().ok()?),
+            };
+            value.encode_as(dt, &mut buf[..width]).ok()?;
+            Some(buf[..width].to_vec())
         }
     }
 }
@@ -464,7 +539,7 @@ mod tests {
         // Missing default → syntax error.
         assert_eq!(
             gw.feed_line("[2] read 0x1000"),
-            GatewayEvent::Respond("[2] ERROR:100".to_string())
+            GatewayEvent::Respond("[2] ERROR:101".to_string())
         );
         // Configure default.
         assert_eq!(
@@ -540,10 +615,32 @@ mod tests {
                 ..
             })
         ));
+        // BUGS.md L3: reset accepts a leading node id like the other NMT
+        // verbs ("4 reset node" / "4 reset comm").
+        assert!(matches!(
+            gw.feed_line("[7] 4 reset node"),
+            GatewayEvent::Request(GatewayRequest {
+                action: GatewayAction::Nmt {
+                    command: GatewayNmt::ResetNode,
+                    node: 4
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            gw.feed_line("[8] 4 reset comm"),
+            GatewayEvent::Request(GatewayRequest {
+                action: GatewayAction::Nmt {
+                    command: GatewayNmt::ResetCommunication,
+                    node: 4
+                },
+                ..
+            })
+        ));
         // Wrong mode token → syntax.
         assert_eq!(
             gw.feed_line("[6] reset banana 4"),
-            GatewayEvent::Respond("[6] ERROR:100".to_string())
+            GatewayEvent::Respond("[6] ERROR:101".to_string())
         );
     }
 
@@ -552,17 +649,19 @@ mod tests {
         let mut gw = Gateway::new();
         assert_eq!(gw.feed_line(""), GatewayEvent::Ignore);
         assert_eq!(gw.feed_line("# comment"), GatewayEvent::Ignore);
-        // Frameless garbage still yields a response so clients never hang.
+        // Frameless garbage still yields a response (seq 0 per CiA 309-3)
+        // so clients never hang.
         assert_eq!(
             gw.feed_line("garbage"),
-            GatewayEvent::Respond("ERROR:100".to_string())
+            GatewayEvent::Respond("[0] ERROR:101".to_string())
         );
         assert_eq!(
             gw.feed_line("[abc] read 0x1000"),
-            GatewayEvent::Respond("[abc] ERROR:100".to_string())
+            // BUGS.md 八L5: an unparseable sequence is not echoed back —
+            // answer with sequence 0 like the frameless branch.
+            GatewayEvent::Respond("[0] ERROR:101".to_string())
         );
-        // Unknown verb → syntax error (CiA reserves 101 for SDO-level
-        // unsupported-object aborts).
+        // Unknown verb → request not supported, CiA 309-3 code 100.
         assert_eq!(
             gw.feed_line("[9] teleport 4"),
             GatewayEvent::Respond("[9] ERROR:100".to_string())
@@ -580,7 +679,30 @@ mod tests {
         );
         assert_eq!(
             Gateway::format_error(3, &GatewayFailure::Code(GatewayErrorCode::Timeout)),
-            "[3] ERROR:300"
+            "[3] ERROR:103"
         );
+    }
+
+    #[test]
+    fn encode_payload_sign_extends_negative_ints() {
+        // BUGS.md #1: negatives must be encoded at the declared width with
+        // sign extension (encode_le + zero-padding produced +255 for `i16 -1`).
+        assert_eq!(
+            encode_payload(GwDataType::Int(16), "-1"),
+            Some(vec![0xFF, 0xFF])
+        );
+        assert_eq!(encode_payload(GwDataType::Int(8), "-5"), Some(vec![0xFB]));
+        assert_eq!(
+            encode_payload(GwDataType::Int(32), "-300"),
+            Some(vec![0xD4, 0xFE, 0xFF, 0xFF])
+        );
+        // u64::MAX is writable (BUGS.md #30: u64 parse, not i64).
+        assert_eq!(
+            encode_payload(GwDataType::Uint(64), "18446744073709551615"),
+            Some(vec![0xFF; 8])
+        );
+        // Out-of-range literals remain a syntax error (R10-P2-10).
+        assert_eq!(encode_payload(GwDataType::Int(8), "300"), None);
+        assert_eq!(encode_payload(GwDataType::Uint(8), "-1"), None);
     }
 }

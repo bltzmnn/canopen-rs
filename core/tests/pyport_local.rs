@@ -3,6 +3,12 @@
 //! master = `SdoClient`), mirroring python-canopen's two-Network virtual
 //! loopback. Deviations from python behaviour are documented inline and in
 //! docs/EXTENSIONS.md 批次 D 差异表 D1–D4.
+//!
+//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! python-canopen's suite and are **not** re-checked by `cargo test` against
+//! `ref/`. After touching any codec, run
+//! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the
+//! transcription against the reference implementation.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

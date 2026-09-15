@@ -6,8 +6,14 @@
 //! the same scripts: every TX entry asserts a byte-exact match with what our
 //! client emits, every RX entry is fed into it. Any divergence from the
 //! python-canopen wire behaviour fails here.
+//!
+//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! python-canopen's suite and are **not** re-checked by `cargo test` against
+//! `ref/`. After touching any codec, run
+//! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the
+//! transcription against the reference implementation.
 
-use canopen_core::datatypes::DataType;
+use canopen_core::datatypes::{DataType, Value};
 use std::collections::VecDeque;
 
 use canopen_core::sdo::{SdoClient, SdoEvent, SdoPayload};
@@ -28,14 +34,18 @@ fn f(bytes: &[u8]) -> SdoPayload {
 }
 
 /// Walks a python-style script: TX entries assert byte-exact output from the
-/// client's pending queue, RX entries feed frames in.
+/// client's pending queue, RX entries feed frames in. Returns the frames the
+/// client actually transmitted plus the value of the last `Complete` event
+/// (if any) — so golden-frame tests can also assert the *decoded* result,
+/// not just the wire bytes (`BUGS.md` TH3).
 fn run_script(
     client: &mut SdoClient,
     first_tx: Vec<SdoPayload>,
     script: &[(Dir, SdoPayload)],
-) -> Vec<SdoPayload> {
+) -> (Vec<SdoPayload>, Option<Value>) {
     let mut pending: VecDeque<SdoPayload> = first_tx.into();
     let mut sent = Vec::new();
+    let mut completed = None;
     for (dir, frame) in script {
         match dir {
             Dir::Tx => {
@@ -52,7 +62,10 @@ fn run_script(
                     SdoEvent::Send(frames) => pending.extend(frames),
                     // Trailing frames (e.g. the block end response) still
                     // need to go on the wire.
-                    SdoEvent::Complete(_, trailing) => pending.extend(trailing),
+                    SdoEvent::Complete(value, trailing) => {
+                        completed = Some(value);
+                        pending.extend(trailing);
+                    }
                     SdoEvent::Done => {}
                 }
             }
@@ -63,7 +76,7 @@ fn run_script(
         "client still holds {} unsent frames",
         pending.len()
     );
-    sent
+    (sent, completed)
 }
 
 /// test_sdo.py:173 — block download of 30 bytes, full frame sequence.
@@ -86,7 +99,7 @@ fn block_download_golden_frames() {
         (Tx, f(&[0xD5, 0x45, 0x69, 0x00, 0x00, 0x00, 0x00, 0x00])),
         (Rx, f(&[0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
     ];
-    run_script(&mut client, first, &script);
+    let (_sent, _value) = run_script(&mut client, first, &script);
 
     // Cross-check the end-frame CRC against an independent computation.
     let crc = canopen_core::sdo::block::crc16(data);
@@ -111,9 +124,14 @@ fn block_upload_golden_frames() {
         (Rx, f(&[0xC9, 0x40, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00])),
         (Tx, f(&[0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
     ];
-    let _sent = run_script(&mut client, first, &script);
-    // The final decoded value lives in the Complete event consumed by the
-    // interpreter; assert via a fresh decode pass below.
+    let (_sent, value) = run_script(&mut client, first, &script);
+    // BUGS.md TH3: the golden frames were only ever compared byte-by-byte —
+    // a value mis-decoded into the wrong string still passed. Assert the
+    // *decoded* result surfaces through `Complete`.
+    assert_eq!(
+        value,
+        Some(Value::Str("Tiny Node - Mega Domains !".to_string()))
+    );
 }
 
 /// test_sdo.py:218 (compressed) — a partial acknowledgement rewinds the
@@ -157,7 +175,7 @@ fn partial_ack_triggers_rewind_and_resend() {
         (Rx, f(&[0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
     ];
 
-    let sent = run_script(&mut client, first, &script);
+    let (sent, _value) = run_script(&mut client, first, &script);
 
     // Rewind verification: frames 8–9 (after initiate/resp + 4 segments +
     // partial-ack RX) are the retransmission, restarting at seqno 1.
@@ -173,11 +191,18 @@ fn partial_ack_triggers_rewind_and_resend() {
         "final segment flagged"
     );
 }
-/// test_sdo.py:191 — zero-length segmented download. Documented deviation
-/// D5: our `SdoClient::write` rejects empty payloads at the API boundary
-/// instead of emitting a zero-length last segment over the wire.
+/// test_sdo.py:191 — zero-length segmented download. Formerly documented
+/// deviation D5 (API rejected empty payloads); since BUGS.md R10-P2-4 the
+/// client matches python-canopen exactly: `size=0` initiate followed by an
+/// empty final segment (`c=1`, no data). Full wire coverage lives in
+/// `zero_length_write_roundtrips_via_segmented`; this keeps the frame-shape
+/// assertion at the API boundary.
 #[test]
-fn zero_length_download_rejected_at_api() {
+fn zero_length_download_emits_empty_final_segment() {
     let mut client = SdoClient::new();
-    assert!(client.write(Address::new(0x2000, 0), b"").is_err());
+    let frames = client.write(Address::new(0x2000, 0), b"").unwrap();
+    assert_eq!(frames.len(), 1);
+    // Segmented initiate with size=0 (command 0x21, s flag set).
+    assert_eq!(frames[0][0], 0x21);
+    assert_eq!(&frames[0][4..8], &[0, 0, 0, 0]);
 }

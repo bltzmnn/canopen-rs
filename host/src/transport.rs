@@ -6,25 +6,26 @@
 //!
 //! [`SocketCan::sdo_read`] / [`SocketCan::sdo_write`] run a whole SDO
 //! transaction per call (expedited/segmented/block chosen automatically),
-//! enforcing one deadline per call and mapping aborts onto
-//! [`HostError::SdoAborted`] (docs/IMPLEMENTATION.md §5.6).
+//! with one timeout retry per call and a *fresh* deadline for each attempt,
+//! mapping aborts onto [`HostError::SdoAborted`]
+//! (docs/IMPLEMENTATION.md §5.6; the deadline reset on retry is intentional,
+//! `BUGS.md` #33).
 
 use socketcan::Socket as _;
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use canopen_core::datatypes::{DataType, Value};
-use canopen_core::nmt::{encode_command, NmtCommand, NMT_COMMAND_COB_ID};
+use canopen_core::nmt::NmtCommand;
 use canopen_core::node::Node;
-use canopen_core::types::{Address, NodeId};
+use canopen_core::types::Address;
 
 use crate::error::HostError;
-use crate::sdo_exchange::Progress;
 
 /// Default deadline for one complete SDO transaction.
 pub const SDO_DEADLINE: Duration = Duration::from_millis(1_000);
 
-const POLL_SLICE: Duration = Duration::from_millis(20);
+pub(crate) const POLL_SLICE: Duration = Duration::from_millis(20);
 
 /// Maps a core SDO error to the host error it represents. Server aborts
 /// surface as [`HostError::SdoAborted`] carrying the abort code; everything
@@ -34,6 +35,17 @@ pub(crate) fn sdo_error(err: canopen_core::types::Error) -> HostError {
         canopen_core::types::Error::SdoAborted(code) => HostError::SdoAborted(code),
         other => other.into(),
     }
+}
+
+/// Shared SDO-response predicate (BUGS.md M5): SDO segments are always
+/// exactly 8 bytes (CANopenNode `CO_SDOclient.c` / `CO_SDOserver.c` check
+/// `DLC == 8U`), so a short frame is malformed on the wire and must not be
+/// zero-padded into a valid-looking response. Both transports call this —
+/// a duplicated inline predicate would drift and start accepting zero-filled
+/// frames.
+#[must_use]
+pub(crate) fn is_valid_sdo_response(rx: &Received, tx_cob: u16) -> bool {
+    rx.cob_id == tx_cob && rx.payload().len() == 8
 }
 
 /// One received frame, narrowed to what CANopen consumes.
@@ -64,7 +76,7 @@ impl Received {
     }
 }
 
-fn classify(frame: &socketcan::CanFrame) -> Option<Incoming> {
+pub(crate) fn classify(frame: &socketcan::CanFrame) -> Option<Incoming> {
     use socketcan::{CanFrame, EmbeddedFrame as _};
     match frame {
         CanFrame::Data(data_frame) => {
@@ -128,14 +140,13 @@ impl SocketCan {
     /// Sends one classic data frame.
     ///
     /// # Errors
-    /// - [`HostError::Protocol`] for oversized IDs/payloads;
+    /// - [`HostError::BadCobId`] / [`HostError::BadPayloadLen`] for
+    ///   oversized IDs/payloads;
     /// - I/O errors propagate.
     pub fn send(&mut self, cob_id: u16, data: &[u8]) -> Result<(), HostError> {
-        let id = socketcan::CanId::standard(cob_id)
-            .ok_or(HostError::Protocol("COB-ID exceeds 11 bits"))?;
+        let id = socketcan::CanId::standard(cob_id).ok_or(HostError::BadCobId)?;
         use socketcan::EmbeddedFrame as _;
-        let frame = socketcan::CanFrame::new(id, data)
-            .ok_or(HostError::Protocol("payload exceeds 8 bytes"))?;
+        let frame = socketcan::CanFrame::new(id, data).ok_or(HostError::BadPayloadLen)?;
         use socketcan::Socket as _;
         self.sock.write_frame(&frame)?;
         Ok(())
@@ -154,20 +165,16 @@ impl SocketCan {
         }
     }
 
-    /// Waits for a data frame from `tx_cob`, skipping unrelated traffic,
-    /// until `deadline`.
-    fn wait_response(&mut self, tx_cob: u16, deadline: Instant) -> Result<[u8; 8], HostError> {
+    /// Receives the next response frame from `tx_cob` (8-byte SDO segments
+    /// only), skipping unrelated traffic, until `deadline`.
+    fn recv_response(&mut self, tx_cob: u16, deadline: Instant) -> Result<[u8; 8], HostError> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(HostError::Timeout);
             }
             match self.recv(remaining.min(POLL_SLICE))? {
-                // SDO segments are always exactly 8 bytes (CANopenNode
-                // CO_SDOclient/server check `DLC == 8U`); short frames are
-                // malformed on the wire and must not be zero-padded into a
-                // valid-looking response.
-                Some(Incoming::Data(rx)) if rx.cob_id == tx_cob && rx.payload().len() == 8 => {
+                Some(Incoming::Data(rx)) if is_valid_sdo_response(&rx, tx_cob) => {
                     return Ok(rx.data)
                 }
                 Some(_) => continue,
@@ -176,28 +183,18 @@ impl SocketCan {
         }
     }
 
-    /// Drives an SDO client to completion against the bus.
-    /// Drives one [`Exchange`] to completion against the bus. All decision
-    /// logic (queueing, abort transmission, terminal interpretation) lives
-    /// in the shared core; this only supplies send/receive (BUGS.md m12).
+    /// Receives one frame (bounded 5 ms window) for the serving loop.
+    fn recv_frame(&mut self) -> Result<Option<Incoming>, HostError> {
+        self.recv(Duration::from_millis(5))
+    }
+
+    // 算法体由 `sdo_exchange` 的 `drive_exchange_body!` 提供（BUGS.md m12）。
     fn drive_exchange(
         &mut self,
         mut ex: crate::sdo_exchange::Exchange,
         deadline: Instant,
     ) -> Result<crate::sdo_exchange::Progress, HostError> {
-        use crate::sdo_exchange::Progress;
-        while let Some(frame) = ex.pop_request() {
-            self.send(ex.request_cob(), &frame)?;
-            let response = self.wait_response(ex.response_cob(), deadline)?;
-            let (extra, progress) = ex.on_response(&response)?;
-            for f in extra {
-                self.send(ex.request_cob(), &f)?;
-            }
-            if !matches!(progress, Progress::Continue) {
-                return Ok(progress);
-            }
-        }
-        Err(HostError::Protocol("transaction ended without completion"))
+        crate::sdo_exchange::drive_exchange_body!(self, ex, deadline, block)
     }
 
     /// Reads an object from `node` over its default SDO channel, decoding
@@ -208,11 +205,7 @@ impl SocketCan {
     /// - [`HostError::SdoAborted`] when the server aborts;
     /// - I/O and protocol errors propagate.
     pub fn sdo_read(&mut self, node: u8, addr: Address, dt: DataType) -> Result<Value, HostError> {
-        let ex = crate::sdo_exchange::Exchange::read(node, addr, dt);
-        match self.drive_exchange(ex, Instant::now() + SDO_DEADLINE)? {
-            Progress::Complete(v) => Ok(v),
-            _ => Err(HostError::Protocol("read ended without a value")),
-        }
+        crate::sdo_exchange::sdo_read_body!(self, node, addr, dt, block)
     }
 
     /// Reads a bulk object into bytes, trying **block transfer** first and
@@ -224,23 +217,7 @@ impl SocketCan {
     /// - [`HostError::SdoAborted`] when both paths are aborted;
     /// - timeouts / IO propagate.
     pub fn read_domain_bytes(&mut self, node: u8, addr: Address) -> Result<Vec<u8>, HostError> {
-        use crate::sdo_exchange::{value_into_bytes, Exchange};
-        let deadline = Instant::now() + SDO_DEADLINE;
-
-        // 1st attempt: block upload.
-        if let Progress::Complete(v) =
-            self.drive_exchange(Exchange::read_block(node, addr, DataType::Domain), deadline)?
-        {
-            return Ok(value_into_bytes(v));
-        }
-        // Complete is the only terminal event for reads; drive_exchange errors
-        // on anything else. Aborts surface as Err(SdoAborted) — fall through.
-
-        // Fallback: expedited/segmented.
-        match self.drive_exchange(Exchange::read(node, addr, DataType::Domain), deadline)? {
-            Progress::Complete(v) => Ok(value_into_bytes(v)),
-            _ => Err(HostError::Protocol("domain read ended without a value")),
-        }
+        crate::sdo_exchange::read_domain_bytes_body!(self, node, addr, block)
     }
 
     /// Writes raw little-endian bytes to an object on `node`.
@@ -248,27 +225,16 @@ impl SocketCan {
     /// # Errors
     /// Same as [`SocketCan::sdo_read`].
     pub fn sdo_write(&mut self, node: u8, addr: Address, data: &[u8]) -> Result<(), HostError> {
-        let ex = crate::sdo_exchange::Exchange::write(node, addr, data)?;
-        match self.drive_exchange(ex, Instant::now() + SDO_DEADLINE)? {
-            Progress::Done => Ok(()),
-            _ => Err(HostError::Protocol("write ended without confirmation")),
-        }
+        crate::sdo_exchange::sdo_write_body!(self, node, addr, data, block)
     }
 
     /// Broadcasts (`None` or `Some(0)`) or targets an NMT command.
     ///
     /// # Errors
     /// Propagates I/O errors; invalid target ids yield
-    /// [`HostError::Protocol`].
+    /// [`HostError::BadNmtTarget`].
     pub fn send_nmt(&mut self, command: NmtCommand, target: Option<u8>) -> Result<(), HostError> {
-        let target = match target {
-            None | Some(0) => None,
-            Some(raw) => Some(
-                NodeId::try_from(raw)
-                    .map_err(|_| HostError::Protocol("NMT target must be 0..=127"))?,
-            ),
-        };
-        self.send(NMT_COMMAND_COB_ID, &encode_command(command, target))
+        crate::sdo_exchange::send_nmt_body!(self, command, target, block)
     }
 
     /// Serves a [`Node`] until `shutdown` becomes true: forwards received
@@ -285,27 +251,7 @@ impl SocketCan {
         node: &mut Node,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<(), HostError> {
-        use std::sync::atomic::Ordering;
-
-        if let Some(boot) = node.boot() {
-            self.send(boot.cob_id, boot.payload())?;
-        }
-        while !shutdown.load(Ordering::Relaxed) {
-            for tx in node.poll(now_ms()) {
-                self.send(tx.cob_id, tx.payload())?;
-            }
-            let Some(incoming) = self.recv(Duration::from_millis(5))? else {
-                continue;
-            };
-            let responses = match incoming {
-                Incoming::Data(rx) => node.on_frame(rx.cob_id, rx.payload()),
-                Incoming::Remote(cob) => node.on_remote_request(cob).into_iter().collect(),
-            };
-            for tx in responses {
-                self.send(tx.cob_id, tx.payload())?;
-            }
-        }
-        Ok(())
+        crate::sdo_exchange::serve_node_body!(self, node, shutdown, block)
     }
 }
 

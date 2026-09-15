@@ -121,8 +121,8 @@ impl StandardObjects {
             ),
         );
 
-        // 0x1014 COB-ID EMCY — default carries bit31 (invalid) until a
-        // node id is assigned; `Node` rewrites it on set_node_id.
+        // 0x1014 COB-ID EMCY — defaults to the predefined value for node id 1
+        // (`0x81`); `Node` rewrites it on set_node_id.
         od.insert(
             Address::new(0x1014, 0),
             Entry::new(
@@ -130,6 +130,39 @@ impl StandardObjects {
                 DataType::Unsigned32,
                 AccessType::Rw,
                 Storage::Value(Value::Uint(0x81)), // 0x80 + node-id(1)
+            ),
+        );
+
+        // 0x1006 Communication cycle period (µs) — ro skeleton. The stack
+        // has no SYNC-period producer yet; exposed so masters inspecting the
+        // communication area find the object (BUGS.md P3-49).
+        od.insert(
+            Address::new(0x1006, 0),
+            Entry::new(
+                "Communication cycle period",
+                DataType::Unsigned32,
+                AccessType::Ro,
+                Storage::Value(Value::Uint(0)),
+            ),
+        );
+        // 0x100C / 0x100D guard time (ms) / life-time factor — ro skeletons
+        // for the guarding feature not implemented by this node.
+        od.insert(
+            Address::new(0x100C, 0),
+            Entry::new(
+                "Guard time",
+                DataType::Unsigned16,
+                AccessType::Ro,
+                Storage::Value(Value::Uint(0)),
+            ),
+        );
+        od.insert(
+            Address::new(0x100D, 0),
+            Entry::new(
+                "Life time factor",
+                DataType::Unsigned8,
+                AccessType::Ro,
+                Storage::Value(Value::Uint(0)),
             ),
         );
 
@@ -155,6 +188,91 @@ impl StandardObjects {
                 DataType::Unsigned8,
                 AccessType::Rw,
                 Storage::Value(Value::Uint(0)),
+            ),
+        );
+
+        // 0x1008/0x1009 Manufacturer device/hardware version — CiA 301
+        // mandatory strings (CANopenNode `CO_ODinterface.h` lists them as
+        // required); application may overwrite via the dictionary.
+        od.insert(
+            Address::new(0x1008, 0),
+            Entry::new(
+                "Manufacturer device name",
+                DataType::VisibleString,
+                AccessType::Ro,
+                Storage::Value(Value::Str(String::new())),
+            ),
+        );
+        od.insert(
+            Address::new(0x1009, 0),
+            Entry::new(
+                "Manufacturer hardware version",
+                DataType::VisibleString,
+                AccessType::Ro,
+                Storage::Value(Value::Str(String::new())),
+            ),
+        );
+
+        // 0x1015 Emergency inhibit time (100 µs units) — rw; consumed by
+        // `Node::raise_emergency`/`poll` (docs/IMPLEMENTATION.md §8.2).
+        od.insert(
+            Address::new(0x1015, 0),
+            Entry::new(
+                "Emergency inhibit time",
+                DataType::Unsigned16,
+                AccessType::Rw,
+                Storage::Value(Value::Uint(0)),
+            ),
+        );
+
+        // 0x1016 Consumer heartbeat time — ARRAY of u32 (nodeId<<16 | ms);
+        // writes reconfigure the node's heartbeat consumer immediately
+        // (`Node::on_parameter_write`, docs/IMPLEMENTATION.md §6.5). Four
+        // slots cover the typical small-network supervision set.
+        od.insert(
+            Address::new(0x1016, 0),
+            Entry::new(
+                "Highest sub-index supported",
+                DataType::Unsigned8,
+                AccessType::Ro,
+                Storage::Value(Value::Uint(4)),
+            ),
+        );
+        for sub in 1..=4u8 {
+            od.insert(
+                Address::new(0x1016, sub),
+                Entry::new(
+                    "Consumer heartbeat time",
+                    DataType::Unsigned32,
+                    AccessType::Rw,
+                    Storage::Value(Value::Uint(0)),
+                ),
+            );
+        }
+
+        // 0x1280 SDO client parameter (CiA 301 / DS301_profile.eds) —
+        // read-only skeleton: the default server request COB-ID. The stack
+        // has no OD-driven SDO client yet; exposed so masters inspecting
+        // the communication area find the expected object.
+        od.insert(
+            Address::new(0x1280, 0),
+            Entry::new(
+                "Highest sub-index supported",
+                DataType::Unsigned8,
+                AccessType::Const,
+                Storage::Value(Value::Uint(1)),
+            ),
+        );
+        // Default follows the builder's node-id-1 convention (like 0x1005 =
+        // 0x81): 0x600 + 1. A bare 0x600 placeholder would never match the
+        // shape-guarded renumbering on node-id changes (`BUGS.md` P2-2).
+        od.insert(
+            Address::new(0x1280, 1),
+            Entry::new(
+                "COB-ID client to server (SDO)",
+                DataType::Unsigned32,
+                AccessType::Ro,
+                Storage::Value(Value::Uint(0x601)),
             ),
         );
 
@@ -223,6 +341,24 @@ mod tests {
             Address::new(0x1018, 4),
         ] {
             assert!(od.read(addr).is_ok(), "mandatory object {addr} missing");
+        }
+    }
+
+    #[test]
+    fn baseline_contains_strings_supervision_and_sdo_client_skeleton() {
+        let od = StandardObjects::new().build();
+        for addr in [
+            Address::new(0x1008, 0),
+            Address::new(0x1009, 0),
+            Address::new(0x1015, 0),
+            Address::new(0x1016, 0),
+            Address::new(0x1280, 1),
+        ] {
+            assert!(od.entry(addr).is_some(), "{addr:?} missing");
+        }
+        assert_eq!(od.read(Address::new(0x1016, 0)).unwrap(), Value::Uint(4));
+        for sub in 1..=4u8 {
+            assert_eq!(od.read(Address::new(0x1016, sub)).unwrap(), Value::Uint(0));
         }
     }
 

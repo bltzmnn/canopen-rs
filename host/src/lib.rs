@@ -4,11 +4,15 @@
 //! and, with the `tokio` feature, async), EDS parsing/code generation and
 //! master-side helpers.
 
+#[cfg(target_os = "linux")]
 pub mod client;
 pub mod codegen;
 pub mod eds;
 pub mod error;
-pub mod profile_402;
+// BUGS.md 十M15: `sdo_exchange` drives the SocketCAN transports and imports
+// `crate::transport`, which only exists on Linux — gating it keeps
+// `eds`/`codegen`/`storage` cross-platform buildable as documented.
+#[cfg(target_os = "linux")]
 pub(crate) mod sdo_exchange;
 pub mod storage;
 

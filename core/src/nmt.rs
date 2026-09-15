@@ -30,7 +30,7 @@ pub const HEARTBEAT_COB_BASE: u16 = 0x700;
 pub enum NmtState {
     /// Boot-up state; reported once via the boot-up frame (0x00).
     Initialising = 0x00,
-    /// Stopped: only SDO active, no PDOs (0x04).
+    /// Stopped: NMT/guarding/heartbeat only, no PDO/SDO (0x04).
     Stopped = 0x04,
     /// Fully operational (0x05).
     Operational = 0x05,
@@ -111,7 +111,9 @@ pub fn encode_command(command: NmtCommand, target: Option<NodeId>) -> [u8; 2] {
 /// Returns `None` for frames shorter than two bytes or unknown commands.
 #[must_use]
 pub fn decode_command(data: &[u8]) -> Option<(NmtCommand, u8)> {
-    if data.len() < 2 {
+    // CiA 301: the NMT command frame is exactly 2 bytes; CANopenNode
+    // (`CO_NMT_Heartbeat.c:38`) ignores any other DLC (BUGS.md 八L12).
+    if data.len() != 2 {
         return None;
     }
     // Target byte: 0 = all nodes, 1..=127 a specific node; anything else
@@ -196,6 +198,14 @@ impl NmtStateMachine {
     /// - resets return to Initialising from any state;
     /// - operational commands are ignored while initialising;
     /// - re-entering the current state is a no-op.
+    ///
+    /// # Reset trap (adjudicated, `BUGS.md` H2)
+    ///
+    /// A reset leaves the machine in `Initialising`; the caller must follow
+    /// up with [`Self::boot`] so the node re-enters PreOperational and
+    /// emits boot-up, exactly like a power-on sequence. This API documents
+    /// the requirement instead of hiding it — `Node::on_nmt` already chains
+    /// the two for the high-level slave.
     pub fn apply(&mut self, command: NmtCommand) -> bool {
         match command {
             // Resets always win.
@@ -293,6 +303,10 @@ struct MonitoredEntry {
 #[derive(Debug, Default)]
 pub struct HeartbeatConsumer {
     monitored: BTreeMap<u8, MonitoredEntry>,
+    /// Supervision tolerance in percent (§6.5): the effective deadline is
+    /// `timeout_ms × (1 + tolerance_pct / 100)`. Zero (default) means
+    /// strict deadlines (`BUGS.md` P3-14).
+    tolerance_pct: u32,
 }
 
 impl HeartbeatConsumer {
@@ -302,11 +316,39 @@ impl HeartbeatConsumer {
         Self::default()
     }
 
+    /// Sets the supervision tolerance in percent applied to every monitored
+    /// node's deadline (0 = strict). Useful on buses with scheduling jitter.
+    pub fn set_tolerance_pct(&mut self, pct: u32) {
+        self.tolerance_pct = pct.min(100);
+    }
+
+    /// Current supervision tolerance in percent.
+    #[must_use]
+    pub const fn tolerance_pct(&self) -> u32 {
+        self.tolerance_pct
+    }
+
+    /// Effective supervision deadline for a configured timeout, including
+    /// the tolerance margin (`BUGS.md` P3-14).
+    #[must_use]
+    pub fn deadline_ms(timeout_ms: u32, tolerance_pct: u32) -> u64 {
+        u64::from(timeout_ms) + (u64::from(timeout_ms) * u64::from(tolerance_pct)) / 100
+    }
+
     /// Starts monitoring `node` with a timeout in ms (reconfiguration is
     /// allowed at runtime, mirroring writes to 0x1016). A `timeout_ms` of
     /// zero disables supervision of that node (CANopenNode semantics for
-    /// `time_us == 0`).
+    /// `time_us == 0`) and drops the entry entirely, so `configured()` and
+    /// the aggregate predicates stop reporting it (`BUGS.md` 十M5).
+    ///
+    /// Reconfiguration with a non-zero timeout keeps the current phase and
+    /// last-seen stamp — only the deadline changes (`BUGS.md` R10-P3,
+    /// documented).
     pub fn set_timeout(&mut self, node: NodeId, timeout_ms: u32) {
+        if timeout_ms == 0 {
+            self.monitored.remove(&node.get());
+            return;
+        }
         let entry = self.monitored.entry(node.get()).or_insert(MonitoredEntry {
             timeout_ms,
             phase: Phase::Unknown,
@@ -332,6 +374,12 @@ impl HeartbeatConsumer {
     /// possibly with guarding toggle which is masked here).
     ///
     /// Frames from unconfigured nodes are ignored.
+    ///
+    /// Adjudicated limitation (`BUGS.md` H2): an undecodable state byte is
+    /// silently dropped — no error is reported and no timeout is started.
+    /// Acceptable from the consumer's point of view (a malformed frame is
+    /// not evidence the producer died), but the frame is consumed without a
+    /// trace.
     pub fn on_heartbeat(&mut self, node: NodeId, data: &[u8], now_ms: u64) -> Vec<HbEvent> {
         let Some(entry) = self.monitored.get_mut(&node.get()) else {
             return Vec::new();
@@ -342,8 +390,14 @@ impl HeartbeatConsumer {
         entry.last_seen_ms = now_ms;
 
         let mut events = Vec::new();
-        if state == NmtState::Initialising && entry.phase == Phase::Active {
-            // Boot-up frame from a live node: remote reset.
+        if state == NmtState::Initialising {
+            // Boot-up frame from a configured (tracked) node: remote reset.
+            // CANopenNode `CO_HBconsumer.c:320-334` fires the
+            // `pFunctSignalRemoteReset` callback for *every* non-UNCONFIGURED
+            // entry — UNKNOWN (never seen since configuration) included; only
+            // the accompanying EMCY report is gated on `HBstate == ACTIVE`.
+            // Entries only exist for monitored nodes, so an event always
+            // fires here (BUGS.md B2).
             events.push(HbEvent::RemoteReset { node });
             entry.phase = Phase::Unknown;
             entry.state = None;
@@ -371,9 +425,16 @@ impl HeartbeatConsumer {
             // (CANopenNode skips entries with `time_us == 0`).
             if entry.timeout_ms > 0
                 && entry.phase == Phase::Active
-                && now_ms.saturating_sub(entry.last_seen_ms) > u64::from(entry.timeout_ms)
+                && now_ms.saturating_sub(entry.last_seen_ms)
+                    >= Self::deadline_ms(entry.timeout_ms, self.tolerance_pct)
             {
                 entry.phase = Phase::TimedOut;
+                // CANopenNode `CO_HBconsumer.c:364-366`: a timed-out entry's
+                // NMT state becomes *unknown*; `state_of` must not keep
+                // reporting the pre-timeout state, and a recovery to the same
+                // state must re-announce `StateChanged` (`getNmtState` only
+                // returns the state while ACTIVE, `:480-484`).
+                entry.state = None;
                 events.push(HbEvent::Lost {
                     node: NodeId::new(id).expect("stored ids are valid"),
                 });
@@ -387,6 +448,19 @@ impl HeartbeatConsumer {
     #[must_use]
     pub fn state_of(&self, node: NodeId) -> Option<NmtState> {
         self.monitored.get(&node.get())?.state
+    }
+
+    /// Whether `node` is under active supervision (a non-zero timeout is
+    /// configured). Only supervised nodes' `0x700+n` frames belong to the
+    /// consumer — anything else in that COB-ID range must stay available
+    /// for custom RPDO/SYNC configurations (`BUGS.md` P3, mirroring
+    /// python-canopen's per-node subscription and CANopenNode's
+    /// per-entry rx filter in `CO_HBconsumer.c`).
+    #[must_use]
+    pub fn supervises(&self, node: NodeId) -> bool {
+        self.monitored
+            .get(&node.get())
+            .is_some_and(|entry| entry.timeout_ms > 0)
     }
 
     /// Whether the node is currently alive (phase Active).
@@ -565,6 +639,26 @@ mod tests {
         assert!(!c.all_operational()); // b is stopped
         c.on_heartbeat(b, &[0x05], 50);
         assert!(c.all_operational());
+    }
+
+    #[test]
+    fn set_timeout_zero_fully_disables_supervision() {
+        // BUGS.md 十M5: the documented "0 disables supervision" must remove
+        // the entry, not leave a zombie that `configured()`/`all_active()`
+        // keep reporting.
+        let mut c = HeartbeatConsumer::new();
+        let n = NodeId::new(3).unwrap();
+        c.set_timeout(n, 100);
+        c.on_heartbeat(n, &[0x05], 10);
+        assert!(c.all_active());
+        assert_eq!(c.state_of(n), Some(NmtState::Operational));
+
+        c.set_timeout(n, 0);
+        assert!(!c.supervises(n));
+        assert!(c.configured().next().is_none());
+        assert!(!c.all_active());
+        assert_eq!(c.state_of(n), None);
+        assert!(c.poll(10_000).is_empty());
     }
 
     #[test]

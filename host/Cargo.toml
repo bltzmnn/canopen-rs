@@ -9,7 +9,6 @@ authors.workspace = true
 
 [dependencies]
 canopen-core.workspace = true
-canopen-402 = { path = "../canopen-402" }
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

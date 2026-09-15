@@ -9,50 +9,12 @@ use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use canopen_core::datatypes::{DataType, Value};
-use canopen_core::nmt::{encode_command, NmtCommand, NMT_COMMAND_COB_ID};
+use canopen_core::nmt::NmtCommand;
 use canopen_core::node::Node;
-use canopen_core::types::{Address, NodeId};
+use canopen_core::types::Address;
 
 use crate::error::HostError;
-use crate::transport::{now_ms, Received, SDO_DEADLINE};
-
-const POLL_SLICE: Duration = Duration::from_millis(20);
-
-/// One received frame, narrowed to what CANopen consumes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Incoming {
-    /// A classic 11-bit data frame.
-    Data(Received),
-    /// A remote transmission request on an 11-bit ID.
-    Remote(u16),
-}
-
-fn classify(frame: &socketcan::CanFrame) -> Option<Incoming> {
-    use socketcan::{CanFrame, EmbeddedFrame as _};
-    match frame {
-        CanFrame::Data(data_frame) => {
-            let embedded_can::Id::Standard(sid) = data_frame.id() else {
-                return None;
-            };
-            let payload = data_frame.data();
-            let mut data = [0u8; 8];
-            let len = payload.len().min(8);
-            data[..len].copy_from_slice(&payload[..len]);
-            Some(Incoming::Data(Received {
-                cob_id: sid.as_raw(),
-                data,
-                len,
-            }))
-        }
-        CanFrame::Remote(remote) => {
-            let embedded_can::Id::Standard(sid) = remote.id() else {
-                return None;
-            };
-            Some(Incoming::Remote(sid.as_raw()))
-        }
-        CanFrame::Error(_) => None,
-    }
-}
+use crate::transport::{classify, is_valid_sdo_response, Incoming, POLL_SLICE};
 
 /// Async SocketCAN socket.
 pub struct AsyncSocketCan {
@@ -82,18 +44,17 @@ impl AsyncSocketCan {
     /// # Errors
     /// Propagates I/O errors.
     pub async fn send(&mut self, cob_id: u16, data: &[u8]) -> Result<(), HostError> {
-        let id = socketcan::CanId::standard(cob_id)
-            .ok_or(HostError::Protocol("COB-ID exceeds 11 bits"))?;
+        let id = socketcan::CanId::standard(cob_id).ok_or(HostError::BadCobId)?;
         use socketcan::EmbeddedFrame as _;
-        let frame = socketcan::CanFrame::new(id, data)
-            .ok_or(HostError::Protocol("payload exceeds 8 bytes"))?;
+        let frame = socketcan::CanFrame::new(id, data).ok_or(HostError::BadPayloadLen)?;
         self.sock.write_frame(frame).await?;
         Ok(())
     }
 
     /// Receives the next classified frame; never returns on its own — wrap
-    /// in [`tokio::time::timeout`] for deadlines. Skips extended/error
-    /// frames internally by re-reading.
+    /// in [`tokio::time::timeout`] for deadlines. Extended and error frames
+    /// classify to `Ok(None)`; the caller re-reads in a loop until it gets
+    /// data or a remote frame.
     ///
     /// # Errors
     /// Propagates I/O errors.
@@ -102,13 +63,22 @@ impl AsyncSocketCan {
         Ok(classify(&frame))
     }
 
-    async fn wait_response(
+    async fn recv_response(
         &mut self,
         tx_cob: u16,
         deadline: Instant,
     ) -> Result<[u8; 8], HostError> {
+        // BUGS.md L4: the deadline arrives on the std clock (shared driver
+        // macro), but the wait below uses `tokio::time::timeout` — mixing
+        // the two clocks directly would decouple them under
+        // `tokio::time::pause()` (std time keeps advancing while tokio's is
+        // frozen), hanging the loop. Re-anchor the deadline onto the tokio
+        // clock at entry so remaining-time arithmetic and the timeout share
+        // one clock.
+        let deadline =
+            tokio::time::Instant::now() + deadline.saturating_duration_since(Instant::now());
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(HostError::Timeout);
             }
@@ -116,10 +86,9 @@ impl AsyncSocketCan {
                 Err(_elapsed) => continue,
                 Ok(Err(e)) => return Err(e),
                 // SDO frames are always exactly 8 bytes (DLC == 8U in
-                // CANopenNode); reject zero-padded short frames.
-                Ok(Ok(Some(Incoming::Data(rx))))
-                    if rx.cob_id == tx_cob && rx.payload().len() == 8 =>
-                {
+                // CANopenNode); reject zero-padded short frames (shared
+                // predicate with the blocking transport, BUGS.md M5).
+                Ok(Ok(Some(Incoming::Data(rx)))) if is_valid_sdo_response(&rx, tx_cob) => {
                     return Ok(rx.data);
                 }
                 Ok(Ok(_)) => continue,
@@ -135,19 +104,15 @@ impl AsyncSocketCan {
         mut ex: crate::sdo_exchange::Exchange,
         deadline: Instant,
     ) -> Result<crate::sdo_exchange::Progress, HostError> {
-        use crate::sdo_exchange::Progress;
-        while let Some(frame) = ex.pop_request() {
-            self.send(ex.request_cob(), &frame).await?;
-            let response = self.wait_response(ex.response_cob(), deadline).await?;
-            let (extra, progress) = ex.on_response(&response)?;
-            for f in extra {
-                self.send(ex.request_cob(), &f).await?;
-            }
-            if !matches!(progress, Progress::Continue) {
-                return Ok(progress);
-            }
+        crate::sdo_exchange::drive_exchange_body!(self, ex, deadline, await)
+    }
+
+    /// Receives one frame (bounded 5 ms window) for the serving loop.
+    async fn recv_frame(&mut self) -> Result<Option<Incoming>, HostError> {
+        match tokio::time::timeout(Duration::from_millis(5), self.recv()).await {
+            Ok(r) => r,
+            Err(_elapsed) => Ok(None),
         }
-        Err(HostError::Protocol("transaction ended without completion"))
     }
 
     /// Reads an object from `node`, decoding against `dt`.
@@ -160,15 +125,22 @@ impl AsyncSocketCan {
         addr: Address,
         dt: DataType,
     ) -> Result<Value, HostError> {
-        use crate::sdo_exchange::Progress;
-        let ex = crate::sdo_exchange::Exchange::read(node, addr, dt);
-        match self
-            .drive_exchange(ex, Instant::now() + SDO_DEADLINE)
-            .await?
-        {
-            Progress::Complete(v) => Ok(v),
-            _ => Err(HostError::Protocol("read ended without a value")),
-        }
+        crate::sdo_exchange::sdo_read_body!(self, node, addr, dt, await)
+    }
+
+    /// Reads a bulk object into bytes, trying **block transfer** first and
+    /// falling back to plain expedited/segmented when the server aborts it.
+    /// Used for pulling device-stored EDS files from 0x1021.
+    ///
+    /// # Errors
+    /// - [`HostError::SdoAborted`] when both paths are aborted;
+    /// - timeouts / IO propagate.
+    pub async fn read_domain_bytes(
+        &mut self,
+        node: u8,
+        addr: Address,
+    ) -> Result<Vec<u8>, HostError> {
+        crate::sdo_exchange::read_domain_bytes_body!(self, node, addr, await)
     }
 
     /// Writes raw little-endian bytes to an object on `node`.
@@ -181,15 +153,7 @@ impl AsyncSocketCan {
         addr: Address,
         data: &[u8],
     ) -> Result<(), HostError> {
-        use crate::sdo_exchange::Progress;
-        let ex = crate::sdo_exchange::Exchange::write(node, addr, data)?;
-        match self
-            .drive_exchange(ex, Instant::now() + SDO_DEADLINE)
-            .await?
-        {
-            Progress::Done => Ok(()),
-            _ => Err(HostError::Protocol("write ended without confirmation")),
-        }
+        crate::sdo_exchange::sdo_write_body!(self, node, addr, data, await)
     }
 
     /// Broadcasts or targets an NMT command.
@@ -201,15 +165,7 @@ impl AsyncSocketCan {
         command: NmtCommand,
         target: Option<u8>,
     ) -> Result<(), HostError> {
-        let target = match target {
-            None | Some(0) => None,
-            Some(raw) => Some(
-                NodeId::try_from(raw)
-                    .map_err(|_| HostError::Protocol("NMT target must be 0..=127"))?,
-            ),
-        };
-        self.send(NMT_COMMAND_COB_ID, &encode_command(command, target))
-            .await
+        crate::sdo_exchange::send_nmt_body!(self, command, target, await)
     }
 
     /// Serves a [`Node`] until `shutdown` flips (async twin of the blocking
@@ -222,30 +178,6 @@ impl AsyncSocketCan {
         node: &mut Node,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<(), HostError> {
-        use std::sync::atomic::Ordering;
-
-        if let Some(boot) = node.boot() {
-            self.send(boot.cob_id, boot.payload()).await?;
-        }
-        while !shutdown.load(Ordering::Relaxed) {
-            for tx in node.poll(now_ms()) {
-                self.send(tx.cob_id, tx.payload()).await?;
-            }
-            // Bounded receive window keeps poll() running periodically.
-            let incoming = match tokio::time::timeout(Duration::from_millis(5), self.recv()).await {
-                Ok(Ok(Some(frame))) => frame,
-                // Transport failures must surface, not be retried silently.
-                Ok(Err(e)) => return Err(e),
-                _ => continue,
-            };
-            let responses = match incoming {
-                Incoming::Data(rx) => node.on_frame(rx.cob_id, rx.payload()),
-                Incoming::Remote(cob) => node.on_remote_request(cob).into_iter().collect(),
-            };
-            for tx in responses {
-                self.send(tx.cob_id, tx.payload()).await?;
-            }
-        }
-        Ok(())
+        crate::sdo_exchange::serve_node_body!(self, node, shutdown, await)
     }
 }

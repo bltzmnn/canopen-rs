@@ -10,10 +10,7 @@
 │  canopen-host (std)                                   │
 │    SocketCan(阻塞) │ AsyncSocketCan(tokio feature)    │
 │    Network/RemoteNode │ EDS 解析 │ OD 代码生成        │
-│    Storage(FileStorage) │ Gateway(CiA309) │ Drive402  │
-├──────────────────────────────────────────────────────┤
-│  canopen-402 (CiA 402 驱动轮廓，sans-I/O)              │
-│    State402 │ CwCommand │ 转移图 BFS │ Drive402      │
+│    Storage(FileStorage) │ Gateway(CiA309)             │
 ├──────────────────────────────────────────────────────┤
 │  canopen-core (sans-I/O 协议核心)                     │
 │    node │ sdo{server,client,block} │ pdo │ nmt        │
@@ -24,7 +21,7 @@
 
 ## 特性
 
-- **SDO**：加速 / 分段 / block transfer（CRC-16/XMODEM、ACK 截断重传、自适应 blksize），server 端 initiate 时权限检查，完整 abort 码表
+- **SDO**：加速 / 分段 / block transfer（CRC-16/XMODEM、ACK 截断重传、download 方向 blksize 协商，上限 127），server 端 initiate 时权限检查，完整 abort 码表
 - **PDO**：子字节位级映射打包、从 OD 装配槽位（0x1400–0x1BFF）、SYNC acyclic/cyclic + sync start value 相位锁定、inhibit time / event timer、RTR 触发
 - **NMT**：从站状态机、boot-up/心跳生产者、node guarding；主站心跳消费者四态机（Started/Lost/RemoteReset 事件携带具体 NodeId）
 - **EMCY**：幂等 raise/clear、错误寄存器重算、历史环形队列与 0x1003 共享存储；消费者多回调 + panic 隔离 + active 表跟踪
@@ -33,8 +30,8 @@
 - **Storage**：0x1010/0x1011 参数持久化（`ParameterStorage` trait + FileStorage 后端）
 - **LED**：CiA 303-3 指示灯位型机（flicker/blink/flash 序列）
 - **Gateway**：CiA 309-3 ASCII 网关最小切片（read/write/NMT/set node）
-- **CiA 402**：独立 crate `canopen-402`——8 态状态机、编译期 BFS 转移路由、操作模式、homing 状态解码
-- **Host**：阻塞 + tokio 异步双 transport、`Network` 订阅分发（回调隔离 + RX 健康检查）、`RemoteNode`（store/restore/write_int/start/stop）、EDS 解析与代码生成、CLI 工具
+- **CiA 402**：不在范围内（原 `canopen-402` crate 已按裁决移除）
+- **Host**：阻塞 + tokio 异步双 transport、`Network` 订阅分发（回调隔离 + RX 健康检查）、`RemoteNode`（store/restore/write_int（最小宽度）/write_int_as（显式宽度）/start/stop）、EDS 解析与代码生成、CLI 工具
 
 ## 快速开始
 
@@ -56,7 +53,8 @@ canopen eds gen device.eds -o od.rs --fn-name build_od
 库用法（master）：
 
 ```rust
-use canopen_core::types::Address;
+use canopen_core::datatypes::DataType;
+use canopen_core::types::{Address, NodeId};
 use canopen_host::client::Network;
 
 let net = Network::open("vcan0")?;
@@ -64,7 +62,7 @@ let node = net.node(5);
 let dt = node.sdo_read(Address::new(0x1000, 0), DataType::Unsigned32)?;
 node.write_int(Address::new(0x1017, 0), 500)?;
 node.start()?;
-net.monitor_heartbeat(NodeId::new(5)?, 1500);
+net.monitor_heartbeat(NodeId::new(5).expect("node id 5 is valid"), 1500);
 for ev in net.heartbeat_events() { /* Started/Lost/… */ }
 let eds = net.read_eds_from_device(5)?; // 经 0x1021 拉取设备自带 EDS
 ```
@@ -85,13 +83,14 @@ loop {
 ## 测试与质量
 
 ```bash
-cargo test --workspace                              # 单测 + 集成 + pyport 回归（203 条，无总线依赖）
+cargo test --workspace                              # 单测 + 集成 + pyport 回归（380 条，无总线依赖）
 python3 tools/interop/python_canopen_oracle.py      # python-canopen 线格式对拍（11/11）
-cargo test -p canopen-host --test vcan              # vcan0 实总线流程
+cargo test -p canopen-host --test vcan -- --ignored # vcan0 实总线流程（先 sudo tools/vcan_setup.sh）
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI（GitHub Actions）运行以上全部；线格式以 [python-canopen](https://github.com/christiansandberg/canopen) 为独立 oracle 对拍。
+以上门禁命令在本地与 CI 环境等效执行（仓库当前未托管 `.github/` 工作流）；
+线格式以 [python-canopen](https://github.com/christiansandberg/canopen) 为独立 oracle 对拍。
 
 真机交叉验证计划（四套件：我方主/从站 × CANopenLinux/python-canopen）见 `tests/interop/TESTPLAN.md`。
 

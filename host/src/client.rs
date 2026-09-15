@@ -9,12 +9,21 @@
 //! command sends are therefore visible to subscribers as well.
 //!
 //! Robustness policies carried over from python-canopen (docs/REFERENCES.md
-//! P2/P3): subscriber callbacks run in isolation — an error in one handler
-//! never kills the RX thread, and [`Network::check`] re-raises a crashed RX
-//! thread to the synchronous caller.
+//! P2/P3): subscriber callbacks run in isolation — a panicking handler is
+//! caught per-callback (counted via [`Network::handler_panic_count`],
+//! `BUGS.md` P1-4), and [`Network::check`] re-raises a crashed RX thread to
+//! the synchronous caller.
+//!
+//! Two contracts applications should know about (`BUGS.md` P3-61):
+//!
+//! - A **non-timeout I/O error** on the socket (e.g. the interface going
+//!   down) permanently ends the RX thread; it surfaces through
+//!   [`Network::check`] rather than recovering silently.
+//! - Subscriber callbacks run on the RX thread and should return quickly;
+//!   a slow callback delays heartbeat supervision by exactly its runtime.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +36,122 @@ use crate::error::HostError;
 use crate::transport::{Incoming, SocketCan};
 
 type Subscriber = std::sync::Arc<dyn Fn(&crate::transport::Received) + Send + Sync>;
+
+/// CiA 301 parameter-save signature written to 0x1010:1 (ASCII "save").
+const SAVE_SIGNATURE: u32 = u32::from_le_bytes(*b"save");
+/// CiA 301 parameter-restore signature written to 0x1011:1 (ASCII "load").
+const RESTORE_SIGNATURE: u32 = u32::from_le_bytes(*b"load");
+
+/// Upper bound for the buffered heartbeat-event queue (`BUGS.md` P3-62):
+/// an application that never drains must not grow the process without
+/// limit; the oldest events are dropped once full.
+const HB_EVENTS_CAP: usize = 1024;
+
+/// Pushes `events` into the shared queue, dropping the oldest entries past
+/// [`HB_EVENTS_CAP`].
+fn push_bounded(
+    queue: &Mutex<std::collections::VecDeque<canopen_core::nmt::HbEvent>>,
+    events: Vec<canopen_core::nmt::HbEvent>,
+) {
+    let mut q = lock_recovered(queue.lock());
+    for e in events {
+        if q.len() >= HB_EVENTS_CAP {
+            q.pop_front();
+        }
+        q.push_back(e);
+    }
+}
+
+/// Dispatches one received frame to all exact-match handlers with per-handler
+/// panic isolation (`BUGS.md` P1-4): a panicking callback must not take down
+/// the RX thread — remaining subscribers still run and the panic is counted.
+/// Returns the number of handler panics observed for this frame.
+fn dispatch_isolated(handlers: &[Subscriber], rx: &crate::transport::Received) -> usize {
+    let mut panics = 0;
+    for handler in handlers {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(rx)));
+        if outcome.is_err() {
+            panics += 1;
+        }
+    }
+    panics
+}
+
+/// Takes a std sync lock, recovering from poisoning (`BUGS.md` P2-3): a
+/// panic in one task while it held the lock must not cascade into panics at
+/// every later accessor — the guarded state stays usable afterwards.
+fn lock_recovered<T>(lock: std::sync::LockResult<T>) -> T {
+    lock.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wire payload for [`RemoteNode::write_int`]: minimal-width signed-aware
+/// encoding, byte-identical to python-canopen's untyped `download()`
+/// (`BUGS.md` P2-1 — a fixed 4-byte pad here had regressed every U8/U16
+/// target; see git history for the full post-mortem).
+#[must_use]
+pub fn encode_write_int(value: i64) -> Vec<u8> {
+    let mut buf = [0u8; 8];
+    let n = canopen_core::datatypes::Value::Int(value)
+        .encode_le(&mut buf)
+        .expect("i64 always fits 8 bytes");
+    buf[..n].to_vec()
+}
+
+/// Wire payload for [`RemoteNode::write_int_as`]: exactly
+/// `dt.fixed_size()` bytes, with negative values bit-cast to unsigned
+/// targets at that width (two's complement).
+///
+/// # Errors
+/// [`canopen_core::types::Error::Other`] when `dt` has no fixed width.
+pub fn encode_write_int_as(
+    value: i64,
+    dt: canopen_core::datatypes::DataType,
+) -> Result<Vec<u8>, canopen_core::types::Error> {
+    use canopen_core::datatypes::{DataType as Dt, Value};
+    // BUGS.md H2: a floating-point target is not an integer encoding —
+    // routing it through the unsigned fallback below produced a confusing
+    // `TypeMismatch` deep inside `encode_as`. Reject at the entry with a
+    // targeted message instead.
+    if matches!(dt, Dt::Real32 | Dt::Real64) {
+        return Err(canopen_core::types::Error::Other(
+            "write_int_as requires an integer/boolean type, got a floating-point target",
+        ));
+    }
+    let size = dt
+        .fixed_size()
+        .filter(|&n| n <= 8)
+        .ok_or(canopen_core::types::Error::Other(
+            "write_int_as requires a fixed-width type",
+        ))?;
+    let typed = match dt {
+        Dt::Boolean => Value::Bool(value != 0),
+        Dt::Integer8
+        | Dt::Integer16
+        | Dt::Integer24
+        | Dt::Integer32
+        | Dt::Integer40
+        | Dt::Integer48
+        | Dt::Integer56
+        | Dt::Integer64 => Value::Int(value),
+        // Unsigned targets: truncate to the declared width in two's
+        // complement so e.g. `-1 as Unsigned16` becomes 0xFFFF instead of
+        // tripping the range check with a full-width u64. A uniform width
+        // mask covers every fixed size (BUGS.md M5 — previously only
+        // 1/2/4-byte types were handled and Unsigned24/40/48/56 rejected
+        // negative values outright).
+        _ => {
+            let mask = if size >= 8 {
+                u64::MAX
+            } else {
+                (1u64 << (size * 8)) - 1
+            };
+            Value::Uint((value as u64) & mask)
+        }
+    };
+    let mut buf = vec![0u8; size];
+    typed.encode_as(dt, &mut buf)?;
+    Ok(buf)
+}
 
 /// How the RX thread died, if it did.
 #[derive(Debug)]
@@ -43,12 +168,23 @@ pub struct Network {
     subscribers: Arc<Mutex<BTreeMap<u16, Vec<Subscriber>>>>,
     /// Heartbeat supervision shared between the RX thread and queries.
     hb: Arc<Mutex<HeartbeatConsumer>>,
+    /// Heartbeat events produced by the RX thread (`Started`/`Lost`/…),
+    /// drained by [`Network::heartbeat_events`] (`BUGS.md` P1-9). The
+    /// consumer is edge-triggered, so events must be buffered where they
+    /// are generated or the application never sees them.
+    hb_events: Arc<Mutex<std::collections::VecDeque<HbEvent>>>,
     /// Persistent CiA 309-3 gateway parser (`set node` survives calls).
     gateway: Mutex<canopen_core::gateway::Gateway>,
     /// RX thread liveness: set when the thread died unexpectedly.
     rx_state: Arc<Mutex<Option<RxDeath>>>,
     rx_shutdown: Arc<AtomicBool>,
-    rx_handle: Option<std::thread::JoinHandle<()>>,
+    /// Join slot behind a mutex so [`Network::shutdown_shared`] can retire
+    /// the RX thread through an `Arc` handle (`BUGS.md` P3-57).
+    rx_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Cumulative count of subscriber callbacks that panicked, incremented
+    /// by the RX thread (`BUGS.md` P1-4); observable via
+    /// [`Network::handler_panic_count`].
+    handler_panics: Arc<AtomicUsize>,
 }
 
 impl Network {
@@ -64,10 +200,12 @@ impl Network {
             cmd: Arc::new(Mutex::new(cmd_sock)),
             subscribers: Arc::new(Mutex::new(BTreeMap::new())),
             hb: Arc::new(Mutex::new(HeartbeatConsumer::new())),
+            hb_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             gateway: Mutex::new(canopen_core::gateway::Gateway::new()),
             rx_state: Arc::new(Mutex::new(None)),
             rx_shutdown: Arc::new(AtomicBool::new(false)),
-            rx_handle: None,
+            rx_handle: Mutex::new(None),
+            handler_panics: Arc::new(AtomicUsize::new(0)),
         };
         network.spawn_rx(rx_sock);
         Ok(network)
@@ -76,39 +214,54 @@ impl Network {
     fn spawn_rx(&mut self, mut sock: SocketCan) {
         let subscribers = self.subscribers.clone();
         let hb = self.hb.clone();
+        let hb_events = self.hb_events.clone();
         let state = self.rx_state.clone();
         let shutdown = self.rx_shutdown.clone();
-        self.rx_handle = Some(std::thread::spawn(move || {
+        let handler_panics = self.handler_panics.clone();
+        *lock_recovered(self.rx_handle.lock()) = Some(std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 while !shutdown.load(Ordering::Relaxed) {
-                    let _ = hb.lock().expect("hb lock").poll(crate::transport::now_ms());
+                    // Buffer edge-triggered events instead of dropping them
+                    // (`BUGS.md` P1-9): the application drains them via
+                    // [`Network::heartbeat_events`].
+                    let timed_out = lock_recovered(hb.lock()).poll(crate::transport::now_ms());
+                    push_bounded(&hb_events, timed_out);
                     let Some(incoming) = sock.recv(Duration::from_millis(10))? else {
                         continue;
                     };
+                    // Remote frames are deliberately not surfaced to
+                    // subscribers: node-guarding observation belongs to a
+                    // dedicated master feature, not the generic dispatch
+                    // (`BUGS.md` P3-64, resolved by documentation).
                     let Incoming::Data(rx) = incoming else {
                         continue;
                     };
                     // Heartbeat supervision first (internal bookkeeping).
-                    if (0x700..=0x77F).contains(&rx.cob_id) {
+                    // A heartbeat frame is exactly 1 byte on the wire
+                    // (CANopenNode `CO_HBconsumer.c:43`), same rule as the
+                    // core path (`core/src/node.rs`, BUGS.md C5).
+                    if is_heartbeat_frame(rx.cob_id, rx.payload()) {
                         if let Ok(node) = NodeId::try_from((rx.cob_id - 0x700) as u8) {
-                            let _ = hb.lock().expect("hb lock").on_heartbeat(
+                            let produced = lock_recovered(hb.lock()).on_heartbeat(
                                 node,
                                 rx.payload(),
                                 crate::transport::now_ms(),
                             );
+                            push_bounded(&hb_events, produced);
                         }
                     }
                     // Exact-match subscriber dispatch; one failing callback
-                    // must not kill the loop (P2). Handlers are cloned out
-                    // and invoked with the registry lock released so a
-                    // callback that re-enters subscribe/unsubscribe (or any
-                    // other lock-taking Network call) cannot deadlock.
+                    // must not kill the loop (`BUGS.md` P1-4): handlers run
+                    // with per-callback panic isolation and are cloned out
+                    // so a callback that re-enters subscribe/unsubscribe (or
+                    // any other lock-taking Network call) cannot deadlock.
                     let handlers = {
-                        let subs = subscribers.lock().expect("subscribers lock");
+                        let subs = lock_recovered(subscribers.lock());
                         subs.get(&rx.cob_id).cloned().unwrap_or_default()
                     };
-                    for handler in &handlers {
-                        handler(&rx);
+                    let panics = dispatch_isolated(&handlers, &rx);
+                    if panics > 0 {
+                        handler_panics.fetch_add(panics, Ordering::Relaxed);
                     }
                 }
                 Ok::<(), HostError>(())
@@ -126,7 +279,7 @@ impl Network {
                 }
             };
             if let Some(death) = death {
-                *state.lock().expect("state lock") = Some(death);
+                *lock_recovered(state.lock()) = Some(death);
             }
         }));
     }
@@ -134,13 +287,20 @@ impl Network {
     /// Registers a callback for exact-COB-ID traffic. Duplicate registration
     /// of the same id appends another handler (python-canopen dedupes; we
     /// allow multiple observers and document it).
+    ///
+    /// # Loopback note (`BUGS.md` H2)
+    ///
+    /// SocketCAN sockets loop frames back by default, so frames **this
+    /// process transmits** (e.g. an SDO request on `0x600+node` sent via the
+    /// command socket) are also delivered to the RX thread. Subscribing to a
+    /// COB-ID the master itself sends therefore fires callbacks on the
+    /// self-echo as well; applications that must ignore it should filter by
+    /// payload or compare the frame against what they last transmitted.
     pub fn subscribe<F>(&self, cob_id: u16, callback: F)
     where
         F: Fn(&crate::transport::Received) + Send + Sync + 'static,
     {
-        self.subscribers
-            .lock()
-            .expect("subscribers lock")
+        lock_recovered(self.subscribers.lock())
             .entry(cob_id)
             .or_default()
             .push(std::sync::Arc::new(callback));
@@ -148,43 +308,43 @@ impl Network {
 
     /// Removes all callbacks for `cob_id`; returns how many were removed.
     pub fn unsubscribe(&self, cob_id: u16) -> usize {
-        self.subscribers
-            .lock()
-            .expect("subscribers lock")
+        lock_recovered(self.subscribers.lock())
             .remove(&cob_id)
             .map_or(0, |handlers| handlers.len())
     }
 
     /// Starts heartbeat supervision of `node` with `timeout_ms`.
     pub fn monitor_heartbeat(&self, node: NodeId, timeout_ms: u32) {
-        self.hb
-            .lock()
-            .expect("hb lock")
-            .set_timeout(node, timeout_ms);
+        lock_recovered(self.hb.lock()).set_timeout(node, timeout_ms);
     }
 
     /// Drains pending heartbeat events (Started/Lost/RemoteReset/StateChanged).
     ///
-    /// Note: events produced inside the RX thread's internal polling are
-    /// coalesced there; this method re-polls with the current time and is
-    /// the intended query point from the application thread.
+    /// Events are captured by the RX thread into an internal queue as they
+    /// occur — the consumer is edge-triggered (a node transitions to
+    /// `TimedOut` exactly once per loss), so this is the only reliable way
+    /// for the application to observe them (`BUGS.md` P1-9). A final
+    /// application-thread poll catches deadlines that elapsed since the
+    /// last RX pass; its output is appended after the queued events.
     pub fn heartbeat_events(&self) -> Vec<HbEvent> {
-        self.hb
-            .lock()
-            .expect("hb lock")
-            .poll(crate::transport::now_ms())
+        let mut out: Vec<HbEvent> = {
+            let mut queue = lock_recovered(self.hb_events.lock());
+            std::mem::take(&mut *queue).into_iter().collect()
+        };
+        out.extend(lock_recovered(self.hb.lock()).poll(crate::transport::now_ms()));
+        out
     }
 
     /// Last reported NMT state of `node`, when known.
     #[must_use]
     pub fn node_state(&self, node: NodeId) -> Option<canopen_core::nmt::NmtState> {
-        self.hb.lock().expect("hb lock").state_of(node)
+        lock_recovered(self.hb.lock()).state_of(node)
     }
 
     /// Whether every monitored node is alive.
     #[must_use]
     pub fn all_nodes_active(&self) -> bool {
-        self.hb.lock().expect("hb lock").all_active()
+        lock_recovered(self.hb.lock()).all_active()
     }
 
     /// Re-raises an RX-thread crash to the caller (P3). Call periodically
@@ -193,11 +353,20 @@ impl Network {
     /// # Errors
     /// Propagates the stored panic message / IO error as [`HostError::Rx`].
     pub fn check(&self) -> Result<(), HostError> {
-        match &*self.rx_state.lock().expect("state lock") {
+        match &*lock_recovered(self.rx_state.lock()) {
             None => Ok(()),
             Some(RxDeath::Panic(msg)) => Err(HostError::Rx(format!("panic: {msg}"))),
             Some(RxDeath::Io(msg)) => Err(HostError::Rx(format!("io: {msg}"))),
         }
+    }
+
+    /// Cumulative number of subscriber callbacks that panicked since the
+    /// network was opened (`BUGS.md` P1-4): panicking handlers are isolated
+    /// so the RX thread survives, and this counter makes the failures
+    /// observable to the application.
+    #[must_use]
+    pub fn handler_panic_count(&self) -> usize {
+        self.handler_panics.load(Ordering::Relaxed)
     }
 
     /// Runs `f` with exclusive access to the command socket.
@@ -206,7 +375,7 @@ impl Network {
         f: impl FnOnce(&mut SocketCan) -> Result<T, HostError>,
     ) -> Result<T, HostError> {
         self.check()?;
-        let mut guard = self.cmd.lock().expect("cmd lock");
+        let mut guard = lock_recovered(self.cmd.lock());
         f(&mut guard)
     }
 
@@ -253,8 +422,10 @@ impl Network {
     /// automatically (CiA 306 files are typically several KiB).
     ///
     /// # Errors
-    /// Transport errors, or [`HostError::Protocol`] when the device does not
-    /// implement 0x1021 / aborts.
+    /// Transport errors; an SDO abort (e.g. the device does not implement
+    /// 0x1021) surfaces as [`HostError::SdoAborted`] (`BUGS.md` 十M24:
+    /// previously the docs claimed `ProtocolIncomplete`, but the abort is
+    /// mapped by `read_domain_bytes` before it could be folded).
     pub fn read_eds_from_device(&self, node: u8) -> Result<crate::eds::Eds, HostError> {
         self.with_cmd(|bus| {
             let bytes = bus.read_domain_bytes(node, Address::new(0x1021, 0))?;
@@ -265,14 +436,31 @@ impl Network {
                 Ok(t) => t,
                 Err(_) => &*bytes.iter().map(|&b| b as char).collect::<String>(),
             };
-            crate::eds::parse(text).map_err(HostError::Core)
+            crate::eds::parse(text).map_err(HostError::Eds)
         })
     }
 
     /// Stops the RX thread. Idempotent; called by [`Drop`](Self::drop).
     pub fn shutdown(&mut self) {
         self.rx_shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.rx_handle.take() {
+        if let Some(handle) = lock_recovered(self.rx_handle.lock()).take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Stops the RX thread through a shared handle (`BUGS.md` P3-57): the
+    /// previous `shutdown(&mut self)` was unreachable for applications that
+    /// hand `Arc<Network>` clones around (the owning drop never runs until
+    /// process exit, leaving the RX thread polling forever).
+    ///
+    /// Idempotent: a second call finds no thread left to join.
+    pub fn shutdown_shared(self: &Arc<Self>) {
+        self.shutdown_arc_inner();
+    }
+
+    fn shutdown_arc_inner(self: &Arc<Self>) {
+        self.rx_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = lock_recovered(self.rx_handle.lock()).take() {
             let _ = handle.join();
         }
     }
@@ -307,16 +495,37 @@ impl RemoteNode<'_> {
         self.network.sdo_write(self.id, addr, data)
     }
 
-    /// Writes an integer value encoded minimally (signed-aware), the common
-    /// case for parameter tweaks.
+    /// Writes an integer value encoded at its *minimal* width (signed-aware),
+    /// mirroring python-canopen's untyped `download()`.
+    ///
+    /// # Width semantics (`BUGS.md` P2-1, see git history)
+    ///
+    /// SDO servers decode expedited downloads at the entry's **declared**
+    /// width, so this succeeds only when the target's declared width equals
+    /// the value's minimal width (e.g. `500` → 2 bytes fits an `Unsigned16`
+    /// like 0x1017, but aborts on an `Unsigned32` object). For any other
+    /// width use [`Self::write_int_as`] with the explicit type, or
+    /// [`Self::sdo_write`] with hand-built bytes.
     ///
     /// # Errors
-    /// Non-integer input or transport errors.
+    /// Non-integer input, a width mismatch on the server, or transport
+    /// errors.
     pub fn write_int(&self, addr: Address, value: i64) -> Result<(), HostError> {
-        let v = Value::Int(value);
-        let mut buf = [0u8; 8];
-        let n = v.encode_le(&mut buf).map_err(HostError::Core)?;
-        self.network.sdo_write(self.id, addr, &buf[..n])
+        let payload = encode_write_int(value);
+        self.network.sdo_write(self.id, addr, &payload)
+    }
+
+    /// Writes an integer encoded at an **explicitly given** type's width —
+    /// the reliable variant of [`Self::write_int`] when the declared entry
+    /// type is known. Negative values into unsigned targets are written as
+    /// two's-complement at that width (`-1` → `[FF FF]` for `Unsigned16`).
+    ///
+    /// # Errors
+    /// `dt` is not a fixed-width type, or the value cannot be represented /
+    /// transport errors.
+    pub fn write_int_as(&self, addr: Address, value: i64, dt: DataType) -> Result<(), HostError> {
+        let payload = encode_write_int_as(value, dt).map_err(HostError::Core)?;
+        self.network.sdo_write(self.id, addr, &payload)
     }
 
     /// NMT start this node.
@@ -343,22 +552,16 @@ impl RemoteNode<'_> {
     /// # Errors
     /// Transport errors or an SDO abort when the device refuses.
     pub fn store(&self) -> Result<(), HostError> {
-        self.sdo_write(
-            Address::new(0x1010, 1),
-            &u32::from_le_bytes(*b"save").to_le_bytes(),
-        )
+        self.sdo_write(Address::new(0x1010, 1), &SAVE_SIGNATURE.to_le_bytes())
     }
 
-    /// Parameter restore: writes "load" to 0x1011:1; defaults return after
-    /// the next reset.
+    /// Parameter restore: writes "load" (0x64616F6C) to 0x1011:1; defaults
+    /// return after the next reset.
     ///
     /// # Errors
     /// Same as [`RemoteNode::store`].
     pub fn restore(&self) -> Result<(), HostError> {
-        self.sdo_write(
-            Address::new(0x1011, 1),
-            &u32::from_le_bytes(*b"daol").to_le_bytes(),
-        )
+        self.sdo_write(Address::new(0x1011, 1), &RESTORE_SIGNATURE.to_le_bytes())
     }
 }
 
@@ -374,7 +577,7 @@ impl Network {
     pub fn gateway_line(&self, line: &str) -> String {
         use canopen_core::gateway::GatewayEvent;
 
-        let mut gw = self.gateway.lock().expect("gateway lock");
+        let mut gw = lock_recovered(self.gateway.lock());
         match gw.feed_line(line) {
             GatewayEvent::Ignore => String::new(),
             GatewayEvent::Respond(text) => text,
@@ -421,7 +624,7 @@ impl Network {
                 let target = (node != 0).then_some(node);
                 self.send_nmt(command.into(), target)
                     .map(|_| None)
-                    .map_err(|_| GatewayFailure::Code(GatewayErrorCode::NmtFailed))
+                    .map_err(|_| GatewayFailure::Code(GatewayErrorCode::InternalState))
             }
             GatewayAction::SetNode(_) => Ok(None),
         }
@@ -432,14 +635,34 @@ fn sdo_failure(err: HostError) -> GatewayFailure {
     match err {
         HostError::SdoAborted(code) => GatewayFailure::SdoAborted(code),
         HostError::Timeout => GatewayFailure::Code(GatewayErrorCode::Timeout),
-        _ => GatewayFailure::Code(GatewayErrorCode::CanFailed),
+        // A generic local IO/CAN failure is "not processed due to internal
+        // state" (CiA 309-3 102); the numeric codes 200/300/301 all carry
+        // specific standard meanings (lost guarding / error passive / bus
+        // off) that this generic path cannot claim.
+        _ => GatewayFailure::Code(GatewayErrorCode::InternalState),
     }
+}
+
+/// Whether `cob_id`/`data` form a well-formed heartbeat frame: the
+/// `0x700 + node` identifier and exactly one payload byte (CANopenNode
+/// `CO_HBconsumer.c:43` latches only DLC == 1; the core path enforces the
+/// same rule, `BUGS.md` C5).
+fn is_heartbeat_frame(cob_id: u16, data: &[u8]) -> bool {
+    (0x700..=0x77F).contains(&cob_id) && data.len() == 1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn heartbeat_frame_requires_one_byte() {
+        assert!(is_heartbeat_frame(0x705, &[0x05]));
+        assert!(!is_heartbeat_frame(0x705, &[]));
+        assert!(!is_heartbeat_frame(0x705, &[0x05, 0x00]));
+        assert!(!is_heartbeat_frame(0x185, &[0x05]));
+    }
 
     /// Registry behaviour: multiple subscribers on one COB-ID all fire and
     /// removal stops delivery. Exercises the same code path the RX thread
@@ -492,5 +715,210 @@ mod tests {
             [HbEvent::Lost { node: lost }] => assert_eq!(*lost, node),
             other => panic!("expected Lost, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lock_recovered_survives_poisoned_mutex() {
+        // BUGS.md P2-3: lock acquisition must recover from a poisoned mutex
+        // instead of cascading panics through every later accessor.
+        let m = Arc::new(Mutex::new(7_u8));
+        let joined = {
+            let m2 = Arc::clone(&m);
+            std::thread::spawn(move || {
+                let _guard = m2.lock().unwrap();
+                panic!("poison the mutex");
+            })
+            .join()
+        };
+        assert!(joined.is_err());
+        assert_eq!(*lock_recovered(m.lock()), 7);
+    }
+}
+
+#[cfg(test)]
+mod p1_regressions {
+    use super::*;
+
+    /// BUGS.md P1-3: the restore signature must be the CiA 301 "load"
+    /// (0x64616F6C) on the wire — a transposed literal ("daol") would be
+    /// silently ignored or aborted by real devices.
+    #[test]
+    fn store_restore_signatures_match_cia301_wire_bytes() {
+        assert_eq!(SAVE_SIGNATURE.to_le_bytes(), *b"save");
+        assert_eq!(SAVE_SIGNATURE, 0x6576_6173);
+        assert_eq!(RESTORE_SIGNATURE.to_le_bytes(), *b"load");
+        assert_eq!(RESTORE_SIGNATURE, 0x6461_6F6C);
+    }
+
+    /// BUGS.md P2-1 (see git history): `write_int` is minimal-width (the
+    /// fixed 4-byte pad regressed every U8/U16 target); explicit widths go
+    /// through `encode_write_int_as`. Both are validated against a *real*
+    /// server decoder — the first round only tested the encoder, which is
+    /// exactly how the U16 regression slipped through.
+    #[test]
+    fn write_int_width_matrix_against_real_server() {
+        use canopen_core::datatypes::DataType as Dt;
+        use canopen_core::sdo::{decode_abort, encode_download_expedited, SdoServer};
+
+        fn server_accepts(addr: Address, dt: Dt, payload: &[u8]) -> bool {
+            let mut od = canopen_core::object_dictionary::ObjectDictionary::new();
+            od.insert(
+                addr,
+                canopen_core::object_dictionary::Entry::new(
+                    "t",
+                    dt,
+                    canopen_core::object_dictionary::AccessType::Rw,
+                    canopen_core::object_dictionary::Storage::Value(
+                        canopen_core::datatypes::Value::Uint(0),
+                    ),
+                ),
+            );
+            let frame = encode_download_expedited(addr, payload).unwrap();
+            let out = SdoServer::new().handle(&mut od, &frame);
+            out.is_empty() || decode_abort(&out[0]).is_err() // success response is not an abort
+        }
+
+        // Minimal-width convenience: succeeds when declared width == value
+        // width; aborts otherwise (documented semantics).
+        assert_eq!(encode_write_int(500), vec![0xF4, 0x01]);
+        assert_eq!(encode_write_int(5), vec![5]);
+        assert!(server_accepts(
+            Address::new(0x1017, 0),
+            Dt::Unsigned16,
+            &encode_write_int(500)
+        ));
+        assert!(!server_accepts(
+            Address::new(0x1017, 0),
+            Dt::Unsigned16,
+            &encode_write_int(5)
+        ));
+
+        // Explicit type: correct at every width.
+        assert_eq!(
+            encode_write_int_as(-1, Dt::Unsigned16).unwrap(),
+            vec![0xFF, 0xFF]
+        );
+        assert_eq!(
+            encode_write_int_as(500, Dt::Unsigned32).unwrap(),
+            vec![0xF4, 0x01, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode_write_int_as(-2, Dt::Integer16).unwrap(),
+            vec![0xFE, 0xFF]
+        );
+        assert_eq!(encode_write_int_as(7, Dt::Unsigned8).unwrap(), vec![7]);
+        // BUGS.md M5: 3/5/6/7-byte unsigned targets take two's-complement
+        // at their own width too (previously only 1/2/4-byte sizes were
+        // handled and negative values hit ValueOutOfRange).
+        assert_eq!(
+            encode_write_int_as(-1, Dt::Unsigned24).unwrap(),
+            vec![0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            encode_write_int_as(-1, Dt::Unsigned40).unwrap(),
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            encode_write_int_as(-1, Dt::Unsigned48).unwrap(),
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            encode_write_int_as(-1, Dt::Unsigned56).unwrap(),
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        // Positive values still encode little-endian at the wider widths.
+        assert_eq!(
+            encode_write_int_as(0x123456, Dt::Unsigned24).unwrap(),
+            vec![0x56, 0x34, 0x12]
+        );
+        // Server-acceptance matrix: expedited downloads only carry ≤4 bytes
+        // (`encode_download_expedited`), so the >4-byte widths are covered
+        // by the encoder assertions above — those frames would go out as
+        // segmented/block transfers instead.
+        for (dt, payload) in [
+            (Dt::Unsigned16, vec![0xFF, 0xFF]),
+            (Dt::Unsigned32, vec![0xF4, 0x01, 0x00, 0x00]),
+            (Dt::Integer16, vec![0xFE, 0xFF]),
+            (Dt::Unsigned8, vec![7]),
+            (Dt::Unsigned24, vec![0xFF, 0xFF, 0xFF]),
+        ] {
+            assert!(
+                server_accepts(Address::new(0x2000, 0), dt, &payload),
+                "{dt:?} must accept {payload:?}"
+            );
+        }
+        // Non-fixed type rejected up front.
+        assert!(encode_write_int_as(1, Dt::Domain).is_err());
+    }
+
+    /// BUGS.md H2: floating-point targets must be rejected at the entry
+    /// with a targeted message, not routed through the unsigned fallback
+    /// into a confusing `TypeMismatch` from `encode_as`.
+    #[test]
+    fn write_int_as_rejects_float_targets_explicitly() {
+        use canopen_core::datatypes::DataType as Dt;
+        let err = encode_write_int_as(3, Dt::Real32).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("floating-point"),
+            "targeted message expected, got: {msg}"
+        );
+        assert!(encode_write_int_as(3, Dt::Real64).is_err());
+        // Integer/boolean targets still work after the entry guard.
+        assert!(encode_write_int_as(3, Dt::Unsigned16).is_ok());
+        assert!(encode_write_int_as(1, Dt::Boolean).is_ok());
+    }
+
+    /// BUGS.md H2: EDS content errors surface as `HostError::Eds`, distinct
+    /// from network/protocol `HostError::Core` so callers can tell them
+    /// apart.
+    #[test]
+    fn eds_content_error_is_distinct_variant() {
+        // An EDS whose default overflows its declared type fails to build a
+        // dictionary (`to_object_dictionary`); that core-level error is what
+        // `read_eds_from_device` wraps into `HostError::Eds`.
+        let eds = crate::eds::parse("[2000]\nParameterName=T\nDataType=0x0005\nDefaultValue=300\n")
+            .unwrap();
+        let core_err = eds.to_object_dictionary(1).unwrap_err();
+        let wrapped = HostError::Eds(core_err);
+        assert!(wrapped.to_string().contains("EDS content error"));
+        // And it stays distinguishable from a plain core error.
+        assert!(!HostError::Core(canopen_core::types::Error::Other("x"))
+            .to_string()
+            .contains("EDS content error"));
+    }
+
+    /// BUGS.md P1-4: a panicking subscriber must not prevent later handlers
+    /// from running (per-handler isolation), and each panic is counted.
+    #[test]
+    fn handler_panic_is_isolated_and_counted() {
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let before = Arc::clone(&hits);
+        let ok_before: Subscriber = Arc::new(move |_| {
+            before.fetch_add(1, Ordering::Relaxed);
+        });
+        let boom: Subscriber = Arc::new(|_: &crate::transport::Received| {
+            panic!("subscriber exploded");
+        });
+        let after = Arc::clone(&hits);
+        let ok_after: Subscriber = Arc::new(move |_| {
+            after.fetch_add(10, Ordering::Relaxed);
+        });
+
+        let rx = crate::transport::Received {
+            cob_id: 0x185,
+            data: [0, 0, 0, 0, 0, 0, 0, 0],
+            len: 0,
+        };
+        let panics = dispatch_isolated(&[ok_before, boom, ok_after], &rx);
+
+        // Both well-behaved handlers ran despite the middle one panicking.
+        assert_eq!(hits.load(Ordering::Relaxed), 11);
+        assert_eq!(panics, 1);
+
+        // No panic at all → zero count.
+        let quiet = dispatch_isolated(&[Arc::new(|_: &crate::transport::Received| {})], &rx);
+        assert_eq!(quiet, 0);
     }
 }

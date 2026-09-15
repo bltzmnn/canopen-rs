@@ -1,6 +1,12 @@
 //! Port of `ref/canopen/test/test_emcy.py` — consumer/producer pairs over
 //! the enhanced [`EmcyConsumer`] (callbacks, isolation, active table) plus
 //! producer idempotence (docs/EXTENSIONS.md 批次 D P-c).
+//!
+//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! python-canopen's suite and are **not** re-checked by `cargo test` against
+//! `ref/`. After touching any codec, run
+//! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the
+//! transcription against the reference implementation.
 
 use std::sync::{Arc, Mutex};
 
@@ -99,12 +105,12 @@ fn producer_send_reset_lifecycle() {
     let mut od = od();
 
     let f1 = em
-        .raise(&mut od, 0x2001, err_reg::CURRENT, [1, 2, 3, 4])
+        .raise(&mut od, 0x2001, err_reg::CURRENT, [1, 2, 3, 4, 5])
         .unwrap();
     assert_eq!(&f1[..3], &[0x01, 0x20, err_reg::CURRENT]);
     // Idempotent re-raise.
     assert!(em
-        .raise(&mut od, 0x2001, err_reg::CURRENT, [0; 4])
+        .raise(&mut od, 0x2001, err_reg::CURRENT, [0; 5])
         .is_none());
 
     let reset = em.clear(&mut od, 0x2001).unwrap();
@@ -112,7 +118,7 @@ fn producer_send_reset_lifecycle() {
 
     // Re-raise after clear works again.
     assert!(em
-        .raise(&mut od, 0x2001, err_reg::CURRENT, [0; 4])
+        .raise(&mut od, 0x2001, err_reg::CURRENT, [0; 5])
         .is_some());
 }
 
@@ -126,7 +132,7 @@ fn producer_reset_frame_clears_consumer_active() {
     let node = NodeId::new(NODE).unwrap();
 
     let f1 = em
-        .raise(&mut prod_od, 0x3100, err_reg::VOLTAGE, [0; 4])
+        .raise(&mut prod_od, 0x3100, err_reg::VOLTAGE, [0; 5])
         .unwrap();
     cons.on_frame(node, EmcyFrame::decode(&f1).unwrap());
     assert_eq!(cons.active().len(), 1);
