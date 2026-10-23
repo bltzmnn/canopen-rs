@@ -1,5 +1,7 @@
 # canopen-rs
 
+[English](README.en.md) | 简体中文
+
 生产级 Rust CANopen（CiA 301/305/306）协议栈，面向 Linux（SocketCAN）。
 
 ```
@@ -83,7 +85,7 @@ loop {
 ## 测试与质量
 
 ```bash
-cargo test --workspace                              # 单测 + 集成 + pyport 回归（380 条，无总线依赖）
+cargo test --workspace                              # 单测 + 集成 + pyport 回归（556 条 + 5 条 doc-test，无总线依赖；vcan 2 条 ignored）
 python3 tools/interop/python_canopen_oracle.py      # python-canopen 线格式对拍（11/11）
 cargo test -p canopen-host --test vcan -- --ignored # vcan0 实总线流程（先 sudo tools/vcan_setup.sh）
 cargo clippy --workspace --all-targets -- -D warnings
@@ -99,5 +101,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 - 架构调研与借鉴来源：`docs/REFERENCES.md`
 - 实施规格与状态：`docs/IMPLEMENTATION.md`
 - 后续拓展路线图：`docs/EXTENSIONS.md`
+- 设计取舍与已排除误报：`docs/DESIGN-DECISIONS.md`
 
 License: Apache-2.0 OR MIT. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
