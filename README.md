@@ -100,4 +100,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 - 实施规格与状态：`docs/IMPLEMENTATION.md`
 - 后续拓展路线图：`docs/EXTENSIONS.md`
 
-License: Apache-2.0 OR MIT
+License: Apache-2.0 OR MIT. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
