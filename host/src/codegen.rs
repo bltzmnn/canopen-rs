@@ -20,7 +20,7 @@ use crate::eds::{Eds, EdsSubEntry, OdExpr};
 /// # Errors
 /// [`canopen_core::types::Error::Other`] when `fn_name` is not a valid Rust identifier — the
 /// name is interpolated verbatim into generated source, so free-form input
-/// would be a code-injection vector (`BUGS.md` P1-8).
+/// would be a code-injection vector (`docs/DESIGN-DECISIONS.md` P1-8).
 pub fn generate_od_module(eds: &Eds, fn_name: &str) -> Result<String, canopen_core::types::Error> {
     if !is_valid_ident(fn_name) {
         return Err(canopen_core::types::Error::Other(
@@ -34,6 +34,12 @@ pub fn generate_od_module(eds: &Eds, fn_name: &str) -> Result<String, canopen_co
         "pub fn {fn_name}(node_id: u8) -> canopen_core::object_dictionary::ObjectDictionary {{"
     );
     out.push_str("    let mut od = canopen_core::object_dictionary::ObjectDictionary::new();\n");
+    // Dummy entries first (`[DummyUsage] Dummy000n=1`), exactly like
+    // `Eds::to_object_dictionary`: a real object at the same index wins
+    // because it is emitted afterwards (docs/DESIGN-DECISIONS.md N11).
+    for (index, entry) in eds.dummy_usage_entries() {
+        emit_entry(&mut out, index, 0, &entry);
+    }
     for object in eds.objects.values() {
         if object.subs.is_empty() {
             continue;
@@ -57,7 +63,7 @@ pub fn generate_od_module(eds: &Eds, fn_name: &str) -> Result<String, canopen_co
 /// Restricts generated identifiers to a conservative lowercase subset that
 /// also excludes Rust keywords/reserved words — `loop`/`fn`/`match` would
 /// otherwise generate uncompilable source instead of a clean error
-/// (`BUGS.md` P3-2).
+/// (`docs/DESIGN-DECISIONS.md` P3-2).
 #[must_use]
 pub fn is_valid_ident(name: &str) -> bool {
     const RUST_WORDS: &[&str] = &[
@@ -71,7 +77,7 @@ pub fn is_valid_ident(name: &str) -> bool {
     let shaped = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     // `_` is not an identifier binding: `pub fn _(...)` does not compile,
-    // so it must be rejected like any other illegal name (`BUGS.md` 十M17).
+    // so it must be rejected like any other illegal name (`docs/DESIGN-DECISIONS.md` 十M17).
     shaped && name != "_" && !RUST_WORDS.contains(&name)
 }
 
@@ -113,27 +119,61 @@ fn emit_value(entry: &EdsSubEntry) -> String {
     let resolved = |expr: &OdExpr| -> String {
         match expr {
             OdExpr::Literal(v) => format!("{v}"),
-            OdExpr::NodeRelative { offset } => {
-                format!("(node_id as i64 + ({offset}))")
-            }
+            // docs/DESIGN-DECISIONS.md EDS-11: the raw `node_id as i64 + offset` overflowed
+            // for extreme offsets — a debug-build panic / release-build
+            // wraparound inside the *generated* module. Emit the same
+            // refusal the runtime path applies (it now resolves in `i128`
+            // and fails the per-type range check), but as an explicit
+            // overflow check so the failure names the cause.
+            OdExpr::NodeRelative { offset } => format!(
+                "i64::checked_add(node_id as i64, {offset}).unwrap_or_else(|| panic!(\"EDS $NODEID offset {offset} overflows i64\"))"
+            ),
             // Non-numeric expressions only reach the type-specific arms.
             OdExpr::Str(_) | OdExpr::Float(_) => String::from("0"),
         }
     };
-    match (&entry.default, entry.data_type) {
+    // ParameterValue overrides DefaultValue for the initial value, exactly
+    // like the runtime `to_value` and python-canopen's local node
+    // (`node/local.py:99-107`, docs/DESIGN-DECISIONS.md 七E2).
+    //
+    // docs/DESIGN-DECISIONS.md EDS-26: python only assigns `var.value` when the value decodes
+    // (`eds.py:375-382`), so an unusable `ParameterValue` falls back to
+    // `DefaultValue`. The same rule is applied here, otherwise the generated
+    // module and the runtime dictionary would disagree on the initial value of
+    // the very same EDS (this exit has its own copy of the selection).
+    let prefer_parameter_value =
+        entry.parameter_value.is_some() && entry.parameter_value_materialises();
+    let default = if prefer_parameter_value {
+        entry.parameter_value.as_ref()
+    } else {
+        entry.default.as_ref()
+    };
+    let default_raw = if prefer_parameter_value {
+        entry.parameter_value_raw.as_deref()
+    } else {
+        entry.default_raw.as_deref()
+    };
+    match (default, entry.data_type) {
         // Typed zero defaults for entries without DefaultValue, matching the
         // runtime EDS path (`EdsSubEntry::to_value`) — a blanket Uint(0)
         // poisoned string/real/signed objects in generated dictionaries
-        // (BUGS.md R10-P1-8).
+        // (docs/DESIGN-DECISIONS.md R10-P1-8).
         (None, Dt::Boolean) => "canopen_core::datatypes::Value::Bool(false)".to_string(),
         (None, Dt::VisibleString) => {
             "canopen_core::datatypes::Value::Str(String::new())".to_string()
         }
-        (None, Dt::OctetString | Dt::UnicodeString | Dt::Domain) => {
+        (None, Dt::OctetString | Dt::Domain) => {
+            "canopen_core::datatypes::Value::Bytes(Vec::new())".to_string()
+        }
+        // docs/DESIGN-DECISIONS.md EDS-14: the runtime exit materialises a UNICODE_STRING
+        // default as `Value::Bytes` (UTF-16LE, like the wire form 八M5); this
+        // arm used to emit `Bytes` here and `Str` for a present default, so
+        // the two exits disagreed on the very same EDS.
+        (None, Dt::UnicodeString) => {
             "canopen_core::datatypes::Value::Bytes(Vec::new())".to_string()
         }
         (None, Dt::Real32 | Dt::Real64) => "canopen_core::datatypes::Value::Real(0.0)".to_string(),
-        // TIME types are fixed 6-byte byte values (`BUGS.md` H1) — the
+        // TIME types are fixed 6-byte byte values (`docs/DESIGN-DECISIONS.md` H1) — the
         // generated default must be Bytes so SDO access matches the
         // runtime `to_value` branch.
         (None, Dt::TimeOfDay | Dt::TimeDifference) => {
@@ -141,12 +181,18 @@ fn emit_value(entry: &EdsSubEntry) -> String {
         }
         (None, dt) if is_signed(dt) => "canopen_core::datatypes::Value::Int(0)".to_string(),
         (None, _) => "canopen_core::datatypes::Value::Uint(0)".to_string(),
+        // python's BOOLEAN conversion is `int(value, 0)`, so a float
+        // expression raises `ValueError` → warning + ignored default;
+        // both build exits keep `false` (docs/DESIGN-DECISIONS.md 七E1).
+        (Some(OdExpr::Float(_)), Dt::Boolean) => {
+            "canopen_core::datatypes::Value::Bool(false)".to_string()
+        }
         (Some(expr), Dt::Boolean) => match expr {
             // Runtime `to_value` routes Boolean strings through
             // `parse_integer_default`; discarding the string here made
             // `DefaultValue="1"` generate `Bool(0 != 0)` and `"true"`
             // generate `false` instead of failing like the runtime path
-            // (BUGS.md 十M14).
+            // (docs/DESIGN-DECISIONS.md 十M14).
             OdExpr::Str(s) => match crate::eds::parse_integer_default(s, Dt::Boolean) {
                 Ok(v) => format!("canopen_core::datatypes::Value::Bool({v} != 0)"),
                 Err(_) => format!(
@@ -161,30 +207,51 @@ fn emit_value(entry: &EdsSubEntry) -> String {
         },
         (Some(OdExpr::Str(s)), Dt::VisibleString) => {
             // `Value::Str` holds an owned `String`; a bare `{s:?}` literal
-            // is `&str` and did not compile (BUGS.md 十H1).
+            // is `&str` and did not compile (docs/DESIGN-DECISIONS.md 十H1).
             format!("canopen_core::datatypes::Value::Str(String::from({s:?}))")
         }
         // Bare numeric / node-relative defaults under a VisibleString keep
         // the raw EDS spelling, mirroring the runtime `to_value`: `0x41`
         // stays `"0x41"` like python-canopen (`eds.py:249-250`), instead of
         // being normalised to `"65"` (十M25).
-        (Some(_), Dt::VisibleString) => match &entry.default_raw {
+        (Some(_), Dt::VisibleString) => match &default_raw {
             Some(raw) => {
                 format!("canopen_core::datatypes::Value::Str(String::from({raw:?}))")
             }
             None => "canopen_core::datatypes::Value::Str(String::new())".to_string(),
         },
-        (Some(OdExpr::Str(s)), Dt::OctetString | Dt::UnicodeString | Dt::Domain) => {
+        (Some(OdExpr::Str(s)), Dt::UnicodeString) => {
+            // docs/DESIGN-DECISIONS.md EDS-05: a UNICODE_STRING default is text in the EDS
+            // (python-canopen `_decode_from_eds` returns the raw string,
+            // `eds.py:246-250`) but the dictionary holds the **wire** form —
+            // UTF-16LE bytes, like every read of such an entry (八M5) and like
+            // this exit's own `None` arm (EDS-14). The runtime `to_value`
+            // encodes the same way, so `Display`/`PartialEq`/the persisted
+            // payload no longer drift between the two exits or between an EDS
+            // default and an SDO readback.
+            let bytes = utf16le_bytes(s);
+            format!("canopen_core::datatypes::Value::Bytes(vec!{bytes:?})")
+        }
+        (Some(_), Dt::UnicodeString) => match &default_raw {
+            Some(raw) => {
+                let bytes = utf16le_bytes(raw);
+                format!("canopen_core::datatypes::Value::Bytes(vec!{bytes:?})")
+            }
+            None => "canopen_core::datatypes::Value::Bytes(Vec::new())".to_string(),
+        },
+        (Some(OdExpr::Str(s)), Dt::OctetString | Dt::Domain) => {
+            // Invalid hex decodes to an empty blob here, mirroring the
+            // runtime `to_value` + the parse-time warning (docs/DESIGN-DECISIONS.md N10).
             let bytes = crate::eds::hex_bytes(s);
             format!("canopen_core::datatypes::Value::Bytes(vec!{bytes:?})")
         }
-        (Some(_), Dt::OctetString | Dt::UnicodeString | Dt::Domain) => {
+        (Some(_), Dt::OctetString | Dt::Domain) => {
             "canopen_core::datatypes::Value::Bytes(Vec::new())".to_string()
         }
         (Some(OdExpr::Float(f)), Dt::Real32 | Dt::Real64) => {
             // `{f:?}` renders `inf` / `NaN`, which are not Rust literals and
             // made the generated module fail to compile for `DefaultValue`
-            // like `1e999` (BUGS.md A3). Emit explicit constants instead.
+            // like `1e999` (docs/DESIGN-DECISIONS.md A3). Emit explicit constants instead.
             let lit = if f.is_nan() {
                 "f64::NAN".to_string()
             } else if f.is_infinite() {
@@ -199,20 +266,31 @@ fn emit_value(entry: &EdsSubEntry) -> String {
             format!("canopen_core::datatypes::Value::Real({lit})")
         }
         (Some(expr), Dt::Real32 | Dt::Real64) => {
-            format!(
-                "canopen_core::datatypes::Value::Real(({}) as f64)",
-                resolved(expr)
-            )
+            // docs/DESIGN-DECISIONS.md EDS-13: python parses REAL defaults with `float(value)`
+            // (`eds.py:251-252`), so a hex literal (`0x10`) or garbage is a
+            // `ValueError` → ignored default. Route the raw spelling through
+            // the same helper the runtime exit uses, so both exits agree on
+            // "no default" (0.0) instead of one reading 16.0 and the other
+            // 0.0.
+            let raw = default_raw.unwrap_or_default();
+            if crate::eds::parse_float_expr(raw).is_some() {
+                format!(
+                    "canopen_core::datatypes::Value::Real(({}) as f64)",
+                    resolved(expr)
+                )
+            } else {
+                "canopen_core::datatypes::Value::Real(0.0)".to_string()
+            }
         }
-        // TIME types are fixed 6-byte byte values (`BUGS.md` H1): hex-string
+        // TIME types are fixed 6-byte byte values (`docs/DESIGN-DECISIONS.md` H1): hex-string
         // defaults decode verbatim, numeric defaults encode little-endian —
         // both mirroring the runtime `to_value` branch.
         (Some(OdExpr::Str(s)), Dt::TimeOfDay | Dt::TimeDifference) => {
             let bytes = crate::eds::hex_bytes(s);
             if bytes.len() != 6 {
-                // BUGS.md 八M10: TIME types are fixed 6-byte values. The
+                // docs/DESIGN-DECISIONS.md 八M10: TIME types are fixed 6-byte values. The
                 // runtime `to_value` rejects any other width at build time
-                // (`BadLength`, BUGS.md L4); the generator must fail the
+                // (`BadLength`, docs/DESIGN-DECISIONS.md L4); the generator must fail the
                 // same way instead of emitting an OD whose every SDO access
                 // aborts later. Malformed hex (`hex_bytes` → empty) is
                 // covered too.
@@ -231,7 +309,7 @@ fn emit_value(entry: &EdsSubEntry) -> String {
             )
         }
         // Float defaults on integer types convert with a range check
-        // instead of resolving to 0 (`BUGS.md` H2) — identical to the
+        // instead of resolving to 0 (`docs/DESIGN-DECISIONS.md` H2) — identical to the
         // runtime `to_value` path; out-of-range values fail loudly.
         (Some(OdExpr::Float(f)), dt) if is_signed(dt) => {
             match crate::eds::float_default_to_int(*f, dt) {
@@ -251,13 +329,13 @@ fn emit_value(entry: &EdsSubEntry) -> String {
         },
         (Some(expr), dt) if is_signed(dt) => {
             // Two's-complement normalisation must match the runtime EDS path
-            // (`crate::eds::wrap_signed_hex`, BUGS.md #15): literals fold at
+            // (`crate::eds::wrap_signed_hex`, docs/DESIGN-DECISIONS.md #15): literals fold at
             // codegen time; node-relative expressions get an *inline* wrap
             // at runtime — a value like `$NODEID+0xF000` exceeds the signed
             // range and must wrap identically on both build exits. The
             // generated module only references `canopen_core::*`, so the
             // wrap logic is emitted inline rather than calling host code.
-            // 越界默认（含字符串字面量，BUGS.md B3-3 / T1-2）与运行时
+            // 越界默认（含字符串字面量，docs/DESIGN-DECISIONS.md B3-3 / T1-2）与运行时
             // `to_value` 的 `encode_as` 校验一致：构建期 panic，而非静默越界值。
             let bits = signed_bits(dt);
             match expr {
@@ -267,7 +345,7 @@ fn emit_value(entry: &EdsSubEntry) -> String {
                         i128::from(wrapped),
                         format!("canopen_core::datatypes::Value::Int({wrapped})"),
                     ),
-                    // BUGS.md 十M15: a magnitude beyond the type's unsigned
+                    // docs/DESIGN-DECISIONS.md 十M15: a magnitude beyond the type's unsigned
                     // range (`INTEGER8 0x100`) must fail loudly like python's
                     // `_signed_int_from_hex`, not wrap to a different value.
                     None => format!("panic!(\"EDS default {v} out of range for {dt:?}\")"),
@@ -291,7 +369,7 @@ fn emit_value(entry: &EdsSubEntry) -> String {
                 },
                 other => {
                     let inner = resolved(other);
-                    // BUGS.md H1: at 64 bits no wrap may be emitted —
+                    // docs/DESIGN-DECISIONS.md H1: at 64 bits no wrap may be emitted —
                     // `1i64 << 64` is a constant-shift compile error and
                     // `(1i64 << 63) - 1` overflows; `wrap_signed_hex` has
                     // the same `bits < 64` guard. An i64 node-relative
@@ -303,7 +381,7 @@ fn emit_value(entry: &EdsSubEntry) -> String {
                         let min_signed = -(1i64 << (bits - 1));
                         let max = (1i64 << (bits - 1)) - 1;
                         let max_unsigned = (1i64 << bits) - 1;
-                        // BUGS.md H2 / 十M15: a node-relative default only
+                        // docs/DESIGN-DECISIONS.md H2 / 十M15: a node-relative default only
                         // resolves at call time, so its range check must run
                         // inside the generated function — reject magnitudes
                         // beyond the unsigned range outright (python
@@ -317,7 +395,7 @@ fn emit_value(entry: &EdsSubEntry) -> String {
             }
         }
         (Some(expr), _) => match expr {
-            // 无符号/其它定宽类型默认：与运行时一致做范围校验（BUGS.md T1-2）。
+            // 无符号/其它定宽类型默认：与运行时一致做范围校验（docs/DESIGN-DECISIONS.md T1-2）。
             // 字符串字面量按需解析并越界 panic；Literal 直接范围校验；
             // NodeRelative 无法静态求值，沿用运行期内联求值。
             OdExpr::Str(s) => match crate::eds::parse_integer_default(s, entry.data_type) {
@@ -338,10 +416,10 @@ fn emit_value(entry: &EdsSubEntry) -> String {
                 format!("canopen_core::datatypes::Value::Uint({})", (*v).max(0)),
             ),
             other => {
-                // BUGS.md 八M9: a node-relative default only resolves at
+                // docs/DESIGN-DECISIONS.md 八M9: a node-relative default only resolves at
                 // call time; a negative result under an unsigned type must
                 // panic — exactly like the runtime `to_value` path returns
-                // `ValueOutOfRange` (BUGS.md M2). The old `.max(0)` clamped
+                // `ValueOutOfRange` (docs/DESIGN-DECISIONS.md M2). The old `.max(0)` clamped
                 // to `Uint(0)`, so the two build exits disagreed. The
                 // remaining upper-bound check reuses `encode_as` exactly
                 // like the runtime path.
@@ -359,13 +437,19 @@ fn emit_value(entry: &EdsSubEntry) -> String {
 /// string literal: [`str::escape_default`] escapes `"`, `\` and control
 /// characters without adding surrounding quotes. The old `{s:?}`
 /// interpolation injected Debug's own quotes and produced uncompilable
-/// `panic!` calls (BUGS.md 十H2).
+/// `panic!` calls (docs/DESIGN-DECISIONS.md 十H2).
+/// UTF-16LE bytes of an EDS UNICODE_STRING default — the wire form
+/// (`docs/DESIGN-DECISIONS.md` EDS-05/EDS-14, 八M5).
+fn utf16le_bytes(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
 fn escape_rust_string(s: &str) -> String {
     s.escape_default().to_string()
 }
 
 /// 整数默认值的构建期范围校验：值越界则生成 `panic!` 表达式（与运行时
-/// `Value::encode_as` 的 `ValueOutOfRange` 一致，BUGS.md T1-2）。`ok` 为
+/// `Value::encode_as` 的 `ValueOutOfRange` 一致，docs/DESIGN-DECISIONS.md T1-2）。`ok` 为
 /// 在范围内时生成的值构造表达式。
 fn int_default_or_panic(dt: DataType, v: i128, ok: String) -> String {
     let (min, max) = crate::eds::int_bounds(dt).unwrap_or((i128::MIN, i128::MAX));
@@ -429,7 +513,7 @@ PDOMapping=1
 "#;
 
     /// String/float/blob defaults used by the source-fragment and
-    /// compile-smoke tests (BUGS.md 十H1).
+    /// compile-smoke tests (docs/DESIGN-DECISIONS.md 十H1).
     const RICH: &str = r#"
 [2001]
 ParameterName=Name
@@ -451,7 +535,7 @@ DefaultValue=01 A2 ff
 "#;
 
     /// Defaults that must fail loudly but still emit compilable Rust
-    /// (BUGS.md 十H2/十M14): invalid signed/unsigned strings, a short TIME
+    /// (docs/DESIGN-DECISIONS.md 十H2/十M14): invalid signed/unsigned strings, a short TIME
     /// hex default and a non-numeric Boolean string.
     const PANIC_DEFAULTS: &str = r#"
 [2010]
@@ -485,15 +569,31 @@ DefaultValue=true
         assert!(!is_valid_ident("BuildOd"));
         assert!(!is_valid_ident("x; drop(od); f"));
         // `_` is a reserved identifier, not a binding: `pub fn _(...)`
-        // cannot compile (`BUGS.md` 十M17).
+        // cannot compile (`docs/DESIGN-DECISIONS.md` 十M17).
         assert!(!is_valid_ident("_"));
         let eds = eds::parse(SAMPLE).unwrap();
         assert!(generate_od_module(&eds, "evil_fn(); }").is_err());
     }
 
-    /// BUGS.md 十M25: a VisibleString hex default keeps its raw spelling in
+    /// docs/DESIGN-DECISIONS.md 十M25: a VisibleString hex default keeps its raw spelling in
     /// generated code (`0x41` → `"0x41"`), mirroring the runtime path and
     /// python-canopen.
+    /// docs/DESIGN-DECISIONS.md EDS-11: a node-relative default is emitted with an explicit
+    /// `i64::checked_add` guard so an extreme `$NODEID±offset` can neither
+    /// panic in debug builds nor wrap in release inside the generated
+    /// module (the runtime path resolves in `i128` and errors instead).
+    #[test]
+    fn node_relative_default_emits_overflow_checked_add() {
+        const EDS: &str = "[2001]\nParameterName=N\nDataType=0x0007\nAccessType=rw\n\
+                           DefaultValue=$NODEID+0x7FFFFFFFFFFFFFFF\n";
+        let eds = eds::parse(EDS).unwrap();
+        let source = generate_od_module(&eds, "od_node_rel").unwrap();
+        assert!(
+            source.contains("i64::checked_add(node_id as i64,"),
+            "node-relative default not overflow-checked:\n{source}"
+        );
+    }
+
     #[test]
     fn visible_string_hex_default_keeps_raw_spelling() {
         const EDS: &str =
@@ -506,9 +606,80 @@ DefaultValue=true
         );
     }
 
+    /// docs/DESIGN-DECISIONS.md N10 + EDS-05/EDS-14: a UNICODE_STRING default is emitted as
+    /// the **wire** bytes (UTF-16LE `Value::Bytes`, like an SDO read of that
+    /// entry and like the runtime `to_value` exit) and the `None` case agrees
+    /// with it; OCTET/DOMAIN keep the hex decode into the same kind.
+    #[test]
+    fn unicode_string_defaults_emit_utf16le_bytes() {
+        const EDS: &str = r#"
+[2001]
+ParameterName=Unicode
+DataType=0x000B
+AccessType=rw
+DefaultValue=abc
+
+[2002]
+ParameterName=Octet
+DataType=0x000A
+AccessType=rw
+DefaultValue=01 A2
+"#;
+        let eds = eds::parse(EDS).unwrap();
+        let source = generate_od_module(&eds, "od_unicode").unwrap();
+        // "abc" in UTF-16LE: 61 00 62 00 63 00
+        assert!(
+            source.contains("Value::Bytes(vec![97, 0, 98, 0, 99, 0])"),
+            "unicode default is not the UTF-16LE wire form:\n{source}"
+        );
+        assert!(
+            source.contains("Value::Bytes(vec![1, 162])"),
+            "octet hex default lost:\n{source}"
+        );
+
+        // A UNICODE_STRING without a default agrees with the runtime exit
+        // (EDS-14): both materialise an empty byte blob.
+        let eds = eds::parse("[2003]\nParameterName=U\nDataType=0x000B\n").unwrap();
+        let source = generate_od_module(&eds, "od_unicode_none").unwrap();
+        assert!(
+            source.contains("Value::Bytes(Vec::new())"),
+            "unicode default-less entry diverges from the runtime exit:\n{source}"
+        );
+        assert_eq!(
+            eds.objects[&0x2003].subs[&0].data_type,
+            canopen_core::datatypes::DataType::UnicodeString
+        );
+    }
+
+    /// docs/DESIGN-DECISIONS.md N11: `[DummyUsage]` entries are emitted before real objects
+    /// so generated and runtime dictionaries agree.
+    #[test]
+    fn dummy_usage_entries_are_emitted() {
+        const EDS: &str = r#"
+[DummyUsage]
+Dummy0001=1
+Dummy0005=1
+
+[2000]
+ParameterName=Real
+DataType=0x0005
+AccessType=rw
+"#;
+        let eds = eds::parse(EDS).unwrap();
+        let source = generate_od_module(&eds, "od_dummy").unwrap();
+        assert!(
+            source.contains("Address::new(0x0001, 0)") && source.contains(r#"Value::Bool(false)"#),
+            "dummy 1 missing:\n{source}"
+        );
+        assert!(
+            source.contains(r#""Dummy0005""#),
+            "dummy 5 missing:\n{source}"
+        );
+    }
+
     #[test]
     fn generated_source_handles_i64_node_relative_defaults() {
-        // BUGS.md H1: `INTEGER64 DefaultValue=$NODEID+0xF000…` previously
+        // docs/DESIGN-DECISIONS.md H1: `INTEGER64 DefaultValue=$NODEID+0xF000…` previously
         // emitted `1i64 << 64` (constant-shift compile error) and
         // `(1i64 << 63) - 1` (overflow). No wrap may be generated at 64
         // bits — the expression is emitted verbatim, matching the runtime
@@ -532,7 +703,7 @@ DefaultValue=0x7FFFFFFFFFFFFFFF
         // at all — offset renders decimal: 0xF000000000 = 15·2³⁶) and the
         // literal folds through `wrap_signed_hex`, which for bits=64
         // returns the value verbatim.
-        assert!(source.contains("Value::Int((node_id as i64 + (1030792151040)))"));
+        assert!(source.contains("i64::checked_add(node_id as i64, 1030792151040)"));
         assert!(source.contains("Value::Int(9223372036854775807)"));
         assert!(!source.contains("1i64 << 64"));
         assert!(!source.contains("1i64 << 63"));
@@ -561,7 +732,7 @@ DefaultValue=7
     fn generated_source_carries_string_and_float_defaults() {
         let eds = eds::parse(RICH).unwrap();
         let source = generate_od_module(&eds, "build_rich").unwrap();
-        // BUGS.md 十H1: `Value::Str` needs an owned `String`.
+        // docs/DESIGN-DECISIONS.md 十H1: `Value::Str` needs an owned `String`.
         assert!(source.contains("Value::Str(String::from(\"My Device\"))"));
         assert!(source.contains("Value::Real(1.5)"));
         assert!(source.contains("vec![1, 162, 255]"));
@@ -569,7 +740,7 @@ DefaultValue=7
 
     #[test]
     fn h3_node_relative_suffix_and_prefix_forms_are_equivalent() {
-        // BUGS.md 十H3: the official `1280+$NODEID` spelling resolves like
+        // docs/DESIGN-DECISIONS.md 十H3: the official `1280+$NODEID` spelling resolves like
         // the prefix form (python-canopen `eds.py:254-259`).
         const SUFFIX: &str = r#"
 [1403sub1]
@@ -581,14 +752,14 @@ DefaultValue=1280+$NODEID
         let eds = eds::parse(SUFFIX).unwrap();
         let source = generate_od_module(&eds, "build_suffix").unwrap();
         assert!(
-            source.contains("node_id as i64 + (1280)"),
+            source.contains("i64::checked_add(node_id as i64, 1280)"),
             "source: {source}"
         );
     }
 
     #[test]
     fn m14_boolean_string_default_matches_runtime() {
-        // BUGS.md 十M14: `DefaultValue="1"` must yield `true` (the runtime
+        // docs/DESIGN-DECISIONS.md 十M14: `DefaultValue="1"` must yield `true` (the runtime
         // path parses it as an integer), not silently invert to `false`.
         const BOOL: &str = r#"
 [2020]
@@ -610,7 +781,7 @@ DefaultValue="1"
 
     #[test]
     fn l10_numeric_visible_string_default_keeps_text() {
-        // BUGS.md 十L10: a bare numeric default under a VisibleString is
+        // docs/DESIGN-DECISIONS.md 十L10: a bare numeric default under a VisibleString is
         // materialised as its textual form on both build exits.
         const TEXTUAL: &str = r#"
 [2021]
@@ -635,9 +806,9 @@ DefaultValue=123
 
     #[test]
     fn m9_negative_node_relative_unsigned_default_panics() {
-        // BUGS.md 八M9: `$NODEID-0x200` under an unsigned type must not be
+        // docs/DESIGN-DECISIONS.md 八M9: `$NODEID-0x200` under an unsigned type must not be
         // silently clamped to 0 — the generated code panics on the negative
-        // result, matching the runtime `to_value` rejection (BUGS.md M2).
+        // result, matching the runtime `to_value` rejection (docs/DESIGN-DECISIONS.md M2).
         const NEG: &str = r#"
 [2006]
 ParameterName=Offset
@@ -654,8 +825,8 @@ DefaultValue=$NODEID-0x200
 
     #[test]
     fn m10_time_hex_default_width_is_validated() {
-        // BUGS.md 八M10: a 3-byte TIME hex default must fail at build time
-        // (like the runtime `to_value` `BadLength`, BUGS.md L4), not emit
+        // docs/DESIGN-DECISIONS.md 八M10: a 3-byte TIME hex default must fail at build time
+        // (like the runtime `to_value` `BadLength`, docs/DESIGN-DECISIONS.md L4), not emit
         // an OD whose every SDO access aborts later.
         const SHORT_TIME: &str = r#"
 [2007]
@@ -670,7 +841,7 @@ DefaultValue=01 02 03
         assert!(!source.contains("Value::Bytes(vec![1, 2, 3])"));
     }
 
-    // NOTE (BUGS.md P3-58 + H2): despite the old misleading name, this test
+    // NOTE (docs/DESIGN-DECISIONS.md P3-58 + H2): despite the old misleading name, this test
     // never compiled the generated source — `build_od_for_test` executes the
     // runtime EDS path instead. Semantic equivalence is checked here;
     // actual compilation of the emitted module is covered by
@@ -682,7 +853,7 @@ DefaultValue=01 02 03
 
         // Sanity-check emitted fragments before executing them.
         assert!(source.contains("pub fn build_od(node_id: u8)"));
-        assert!(source.contains("node_id as i64 + (512)"));
+        assert!(source.contains("i64::checked_add(node_id as i64, 512)"));
         assert!(source.contains("DataType::Integer16"));
 
         // Compile+run the emitted function via a tiny dynamic harness.
@@ -771,7 +942,7 @@ DefaultValue=01 02 03
 
     #[test]
     fn generated_module_compiles_with_rustc() {
-        // BUGS.md H2: `generated_fragments_match_runtime_resolution` never
+        // docs/DESIGN-DECISIONS.md H2: `generated_fragments_match_runtime_resolution` never
         // compiles the emitted module — a syntax/type error in the
         // generated source would go unnoticed. Actually compile it against
         // the workspace's canopen_core rlib and run the resulting binary so
@@ -808,5 +979,83 @@ DefaultValue=01 02 03
         let panics = eds::parse(PANIC_DEFAULTS).unwrap();
         let panic_source = generate_od_module(&panics, "build_panic").unwrap();
         let _ = compile_generated(&panic_source, "build_panic", "panic");
+    }
+
+    /// docs/DESIGN-DECISIONS.md 七E1: a float default on a Boolean entry must not take the
+    /// unsigned path (`Value::Uint`) — python ignores it (`int("1.5", 0)`
+    /// raises) and the runtime materialises `Bool(false)`, so the generated
+    /// code must agree.
+    #[test]
+    fn e1_float_default_on_boolean_emits_false() {
+        const EDS: &str = r#"
+[2000]
+ParameterName=Flag
+DataType=0x0001
+AccessType=rw
+DefaultValue=1.5
+"#;
+        let eds = eds::parse(EDS).unwrap();
+        let source = generate_od_module(&eds, "od_bool").unwrap();
+        assert!(
+            source.contains("Value::Bool(false)"),
+            "expected Bool(false), got:\n{source}"
+        );
+        assert!(
+            !source.contains("Value::Uint(1)"),
+            "float-on-Boolean must not go through the unsigned path:\n{source}"
+        );
+    }
+
+    /// docs/DESIGN-DECISIONS.md EDS-26: an unusable `ParameterValue` (non-numeric on an integer
+    /// entry, non-hex on a blob entry) must not win over a valid
+    /// `DefaultValue` — python only assigns `var.value` when the value decodes
+    /// (`eds.py:375-382`). The generated module has to agree with the runtime
+    /// dictionary on the initial value.
+    #[test]
+    fn invalid_parameter_value_falls_back_to_default_value() {
+        const EDS: &str = r#"
+[2000]
+ParameterName=Gain
+DataType=0x0007
+AccessType=rw
+DefaultValue=1
+ParameterValue=zz
+[2001]
+ParameterName=Blob
+DataType=0x000A
+AccessType=rw
+DefaultValue=01 A2
+ParameterValue=zz
+"#;
+        let eds = eds::parse(EDS).unwrap();
+        let source = generate_od_module(&eds, "od_bad_param").unwrap();
+        assert!(
+            source.contains("Value::Uint(1)"),
+            "integer entry must fall back to DefaultValue=1:\n{source}"
+        );
+        assert!(
+            source.contains("[1, 162]") || source.contains("0x01, 0xA2"),
+            "blob entry must fall back to DefaultValue=01 A2:\n{source}"
+        );
+    }
+
+    /// docs/DESIGN-DECISIONS.md 七E2: `ParameterValue` drives the generated initial value,
+    /// like the runtime `to_value` and python-canopen's local node.
+    #[test]
+    fn e2_parameter_value_wins_in_codegen() {
+        const EDS: &str = r#"
+[2000]
+ParameterName=Gain
+DataType=0x0007
+AccessType=rw
+DefaultValue=1
+ParameterValue=42
+"#;
+        let eds = eds::parse(EDS).unwrap();
+        let source = generate_od_module(&eds, "od_param").unwrap();
+        assert!(
+            source.contains("Value::Uint(42)"),
+            "ParameterValue must drive the generated default:\n{source}"
+        );
     }
 }

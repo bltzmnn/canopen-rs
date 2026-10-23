@@ -37,7 +37,12 @@ pub enum HostError {
     Core(#[from] canopen_core::types::Error),
     /// EDS content error surfaced separately from core protocol errors so
     /// callers can tell a device-side EDS problem (out-of-range default,
-    /// bad length, …) from a network/protocol failure (`BUGS.md` H2).
+    /// bad length, …) from a network/protocol failure (`docs/DESIGN-DECISIONS.md` H2).
+    ///
+    /// Produced by [`crate::eds::Eds::build`], which wraps the underlying
+    /// [`canopen_core::types::Error`] from the dictionary build — the
+    /// network-facing helpers return the raw [`Eds`](crate::eds::Eds) and
+    /// leave the choice of channel to the caller (`docs/DESIGN-DECISIONS.md` API-08).
     #[error("EDS content error: {0}")]
     Eds(canopen_core::types::Error),
     /// The network RX thread died (panic or fatal IO).

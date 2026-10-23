@@ -13,10 +13,10 @@ script must then be reconciled.
 
 Because the canopen-rs side is produced by the real codecs at oracle time
 (rather than hand-transcribed constants), encoder drift cannot be silently
-hand-synced into ``EXPECTED_FRAMES`` anymore (``BUGS.md`` TH1). The
+hand-synced into ``EXPECTED_FRAMES`` anymore (``docs/DESIGN-DECISIONS.md`` TH1). The
 CRC-16/XMODEM is additionally cross-checked over several payloads against
 ``binascii.crc_hqx`` — the same primitive python-canopen's block transfer
-uses (``BUGS.md`` TH2).
+uses (``docs/DESIGN-DECISIONS.md`` TH2).
 
 Coverage: SDO expedited downloads (u32/u8/i16), segmented download
 (initiate + full segment stream driven through python-canopen's state machine

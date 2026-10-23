@@ -26,6 +26,10 @@ pub(super) const CS_6: u8 = 0xC0;
 pub(super) const CS_5: u8 = 0xA0;
 
 const CS_MASK: u8 = 0xE0;
+/// Reserved command bits 4..3 for the block families: CANopenNode's initiate
+/// masks (`0xF9`/`0xFB`) require them to be zero (`CO_SDOserver.c:627-632`;
+/// docs/DESIGN-DECISIONS.md SDO-30).
+pub(super) const RESERVED_MASK: u8 = 0x18;
 
 /// 'cc'/'sc' bit in an initiate frame; also the CRC-error flag in the end
 /// response.
@@ -42,7 +46,7 @@ const LAST_SEGMENT: u8 = 0x80; // 'c' bit in a sub-block segment
 const SEQNO_MASK: u8 = 0x7F;
 
 /// Maximum data bytes in one sub-block segment — single source of truth in
-/// the module root (`BUGS.md` L6).
+/// the module root (`docs/DESIGN-DECISIONS.md` L6).
 pub use super::SEGMENT_DATA_MAX;
 /// Maximum segments in one sub-block.
 pub const MAX_BLKSIZE: u8 = 127;
@@ -71,7 +75,7 @@ pub fn crc16(data: &[u8]) -> u16 {
 /// has been acknowledged. While segments are still streaming, every incoming
 /// frame is routed as a sub-block segment first (their byte 0 carries a raw
 /// sequence number whose top bits overlap the end frame's shape), so callers
-/// must not check for the end frame unconditionally (`BUGS.md` 架构速查).
+/// must not check for the end frame unconditionally (`docs/DESIGN-DECISIONS.md` 架构速查).
 #[must_use]
 pub fn is_end_frame(p: &SdoPayload) -> bool {
     p[0] & CS_MASK == CS_6 && p[0] & SUBCMD_MASK == SUBCMD_END
@@ -208,7 +212,7 @@ pub fn decode_upload_initiate_response(p: &SdoPayload) -> Result<BlockInitiate> 
 /// Deliberately all-zero beyond the command byte, matching both reference
 /// implementations byte-for-byte (python-canopen `client.py:512`, CANopenNode
 /// `CO_SDOclient.c:1600`) — R10-P1-3's premise that byte 1/2 carry
-/// blksize/CRC is not borne out by either (`BUGS.md` 撤销项).
+/// blksize/CRC is not borne out by either (`docs/DESIGN-DECISIONS.md` 撤销项).
 #[must_use]
 pub fn encode_upload_start() -> SdoPayload {
     let mut p = [0u8; 8];
@@ -221,7 +225,10 @@ pub fn encode_upload_start() -> SdoPayload {
 /// # Errors
 /// [`Error::UnexpectedFrame`] on a foreign command byte.
 pub fn decode_upload_start(p: &SdoPayload) -> Result<()> {
-    if p[0] & CS_MASK != CS_5 || p[0] & SUBCMD_MASK != SUBCMD_START {
+    // CANopenNode compares the *whole* byte (`CO_SDOserver.c:972` is
+    // `CANrxData[0] == 0xA3`), so reserved bits are not tolerated — the mask
+    // check accepted `0xAB`/`0xA7`/… as starts (`docs/DESIGN-DECISIONS.md` SDO-06).
+    if p[0] != CS_5 | SUBCMD_START {
         return Err(Error::UnexpectedFrame);
     }
     Ok(())
@@ -244,7 +251,12 @@ fn encode_initiate_with_size(cs: u8, addr: Address, size: Option<u32>, crc: bool
 fn decode_initiate_with_size(cs: u8, p: &SdoPayload) -> Result<BlockInitiate> {
     // On a size-carrying initiate, bit 1 is the 's' flag, so the initiate/end
     // sub-command is bit 0 alone (0 = initiate); don't match the full 2 bits.
-    if p[0] & CS_MASK != cs || p[0] & SUBCMD_END != 0 {
+    // Reserved bits 4..3 must be zero: CANopenNode's idle-state classifier
+    // uses the masks `(& 0xF9) == 0xC0` / `(& 0xFB) == 0xA0`
+    // (`CO_SDOserver.c:627-632`, client mirror `CO_SDOclient.c:652,1321`), so
+    // a `0xD8`/`0xB8` frame is an illegal command, not an initiate
+    // (docs/DESIGN-DECISIONS.md SDO-30).
+    if p[0] & CS_MASK != cs || p[0] & SUBCMD_END != 0 || p[0] & RESERVED_MASK != 0 {
         return Err(Error::UnexpectedFrame);
     }
     let size = (p[0] & SIZE_INDICATED != 0).then(|| u32::from_le_bytes([p[4], p[5], p[6], p[7]]));
@@ -267,7 +279,7 @@ fn encode_initiate_with_blksize(cs: u8, addr: Address, blksize: u8, crc: bool) -
 }
 
 fn decode_initiate_with_blksize(cs: u8, p: &SdoPayload) -> Result<BlockNegotiation> {
-    if p[0] & CS_MASK != cs || p[0] & SUBCMD_MASK != SUBCMD_INITIATE {
+    if p[0] & CS_MASK != cs || p[0] & SUBCMD_MASK != SUBCMD_INITIATE || p[0] & RESERVED_MASK != 0 {
         return Err(Error::UnexpectedFrame);
     }
     Ok(BlockNegotiation {
@@ -330,7 +342,9 @@ pub fn encode_sub_response(ackseq: u8, blksize: u8) -> SdoPayload {
 /// # Errors
 /// [`Error::UnexpectedFrame`] on a foreign command byte.
 pub fn decode_sub_response(p: &SdoPayload) -> Result<(u8, u8)> {
-    if p[0] & CS_MASK != CS_5 || p[0] & SUBCMD_MASK != SUBCMD_RESPONSE {
+    // Exact byte like CANopenNode's `CANrxData[0] == 0xA2`
+    // (`CO_SDOserver.c:984`, docs/DESIGN-DECISIONS.md SDO-06).
+    if p[0] != CS_5 | SUBCMD_RESPONSE {
         return Err(Error::UnexpectedFrame);
     }
     Ok((p[1], p[2]))
@@ -371,7 +385,7 @@ pub fn encode_end_response() -> SdoPayload {
 ///
 /// CiA 301 block download end response byte 0 is `101 sc 01`; `sc = 1`
 /// means the server detected a CRC error and did **not** store the data.
-/// Such a response must not be mistaken for success (BUGS.md 八M6 —
+/// Such a response must not be mistaken for success (docs/DESIGN-DECISIONS.md 八M6 —
 /// CANopenNode `CO_SDOclient.c:717-731` accepts only `0xA1`).
 ///
 /// # Errors
@@ -396,7 +410,7 @@ pub fn decode_end_response(p: &SdoPayload) -> Result<()> {
 /// Whether `blksize` is a legal sub-block size (`1..=127`). Values outside
 /// this range must be rejected with abort `0x0504_0002` per CiA 301 /
 /// CANopenNode `CO_SDOserver.c:953-958` — the previous silent clamp to 1
-/// masked malformed peers (BUGS.md P3-26).
+/// masked malformed peers (docs/DESIGN-DECISIONS.md P3-26).
 #[must_use]
 pub const fn is_valid_blksize(blksize: u8) -> bool {
     blksize >= 1 && blksize <= MAX_BLKSIZE
@@ -564,6 +578,9 @@ impl BlockReceiver {
     /// `unused` tail, then optionally verifies the transfer CRC.
     ///
     /// # Errors
+    /// - [`Error::BlockEndAllPadding`] when the end frame's `unused` count
+    ///   covers the whole received data (a malformed block, `docs/DESIGN-DECISIONS.md`
+    ///   SDO-36);
     /// - [`Error::BadLength`] when trimming below zero / beyond the buffer;
     /// - [`Error::CrcMismatch`] on a CRC failure.
     pub fn finish(
@@ -573,13 +590,27 @@ impl BlockReceiver {
         crc: u16,
         verify_crc: bool,
     ) -> Result<()> {
+        // docs/DESIGN-DECISIONS.md SDO-36: the reference compares `bufOffsetWr <= noData`
+        // **first**, before it looks at the size-indication bit, and aborts
+        // `CO_SDO_AB_DEVICE_INCOMPAT` (`CO_SDOserver.c:908-916`). The guard
+        // used to sit inside the `Some(n)` arm only, so the `s=0` end frame —
+        // which **both** reference clients send (`encode_end` here never sets
+        // the bit, python `sdo/client.py:806-809` likewise) — still folded
+        // `buf.len() == unused` into `truncate(0)`, wiping a previously
+        // non-empty variable-length object and answering `0xA1`.
+        if self.buf.len() <= usize::from(unused) {
+            return Err(Error::BlockEndAllPadding {
+                unused,
+                received: self.buf.len(),
+            });
+        }
         if let Some(n) = final_len {
-            // BUGS.md #23: trim the end-frame's `unused` tail *before*
+            // docs/DESIGN-DECISIONS.md #23: trim the end-frame's `unused` tail *before*
             // comparing against the declared size, exactly like CANopenNode
             // (`sizeTran -= noData` then the size check). Declaring 10 but
             // streaming 7+7 (with pad) must abort instead of storing the pad
             // byte as data when CRC is not negotiated.
-            let data_len = self.buf.len().saturating_sub(usize::from(unused));
+            let data_len = self.buf.len() - usize::from(unused);
             if data_len != n {
                 return Err(Error::BadLength {
                     declared: n,
@@ -610,7 +641,7 @@ mod tests {
 
     #[test]
     fn receiver_bound_allows_only_last_segment_overshoot() {
-        // BUGS.md m9: a declared 10-byte transfer streams 7 + (7 with pad).
+        // docs/DESIGN-DECISIONS.md m9: a declared 10-byte transfer streams 7 + (7 with pad).
         // Mid-transfer growth past the bound must abort; the final
         // segment's overshoot is trimmed by `finish`.
         let mut r = BlockReceiver::new();
@@ -631,7 +662,7 @@ mod tests {
 
         // Fresh receiver: final segment may overshoot, then trim. The final
         // 7-byte segment carries 3 real bytes + 4 pad bytes; the end frame
-        // reports `unused=4` (BUGS.md #23), so `finish` trims the pad before
+        // reports `unused=4` (docs/DESIGN-DECISIONS.md #23), so `finish` trims the pad before
         // comparing against the declared 10 — mirroring CANopenNode's
         // `sizeTran -= noData` length check.
         let mut r = BlockReceiver::new();
@@ -709,7 +740,7 @@ mod tests {
         assert_eq!(decode_end(&encode_end(5, 0xBEEF)).unwrap(), (5, 0xBEEF));
         assert_eq!(encode_end_response(), [0xA1, 0, 0, 0, 0, 0, 0, 0]);
         assert!(decode_end_response(&encode_end_response()).is_ok());
-        // BUGS.md 八M6: sc=1 (CRC error, data not stored) must fail.
+        // docs/DESIGN-DECISIONS.md 八M6: sc=1 (CRC error, data not stored) must fail.
         let crc_error = [0xA5, 0, 0, 0, 0, 0, 0, 0];
         assert!(matches!(
             decode_end_response(&crc_error),

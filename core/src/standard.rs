@@ -87,6 +87,11 @@ impl StandardObjects {
         );
 
         // 0x1001 Error register — mandatory, ro (maintained by EMCY).
+        // docs/DESIGN-DECISIONS.md OD-03: DS-301 declares `PDOMapping=1` for this object
+        // (`DS301_profile.eds:66-73`; contrast 0x1000 with `PDOMapping=0`),
+        // and mapping the error register into a TPDO is everyday practice.
+        // Without the flag such a slot failed `PdoMapping::validate_against`
+        // and vanished into the config-error ring.
         od.insert(
             Address::new(0x1001, 0),
             Entry::new(
@@ -94,7 +99,8 @@ impl StandardObjects {
                 DataType::Unsigned8,
                 AccessType::Ro,
                 Storage::Value(Value::Uint(0)),
-            ),
+            )
+            .pdo_mappable(),
         );
 
         // 0x1003 Pre-defined error field — sub0 is the number of logged
@@ -121,6 +127,31 @@ impl StandardObjects {
             ),
         );
 
+        // 0x1012 COB-ID time stamp object — CiA 301 TIME configuration
+        // (`DS301_profile.eds:447-454`): bit31 = consumer, bit30 = producer,
+        // bits 10..0 = COB-ID; default 0x100 with both roles disabled.
+        // docs/DESIGN-DECISIONS.md SYN-10 used to hardcode 0x100 and consume it unconditionally.
+        od.insert(
+            Address::new(0x1012, 0),
+            Entry::new(
+                "COB-ID time stamp object",
+                DataType::Unsigned32,
+                AccessType::Rw,
+                Storage::Value(Value::Uint(0x100)),
+            ),
+        );
+        // 0x1013 High resolution time stamp — optional DS-301 object; stored
+        // for masters that read it, with no producer semantics here.
+        od.insert(
+            Address::new(0x1013, 0),
+            Entry::new(
+                "High resolution time stamp",
+                DataType::Unsigned32,
+                AccessType::Rw,
+                Storage::Value(Value::Uint(0)),
+            ),
+        );
+
         // 0x1014 COB-ID EMCY — defaults to the predefined value for node id 1
         // (`0x81`); `Node` rewrites it on set_node_id.
         od.insert(
@@ -133,26 +164,33 @@ impl StandardObjects {
             ),
         );
 
-        // 0x1006 Communication cycle period (µs) — ro skeleton. The stack
-        // has no SYNC-period producer yet; exposed so masters inspecting the
-        // communication area find the object (BUGS.md P3-49).
+        // 0x1006 Communication cycle period (µs) — readWrite per DS-301
+        // (`DS301_profile.xpd:741`: `UID_OBJ_1006 access="readWrite"`) and
+        // consumed by this stack's SYNC silence supervision (`Node::poll`:
+        // 1.5× period without a SYNC raises 0x8100). It used to be a
+        // read-only skeleton, which made the supervision unreachable through
+        // the standard SDO configuration path (docs/DESIGN-DECISIONS.md SYN-07).
         od.insert(
             Address::new(0x1006, 0),
             Entry::new(
                 "Communication cycle period",
                 DataType::Unsigned32,
-                AccessType::Ro,
+                AccessType::Rw,
                 Storage::Value(Value::Uint(0)),
             ),
         );
-        // 0x100C / 0x100D guard time (ms) / life-time factor — ro skeletons
-        // for the guarding feature not implemented by this node.
+        // 0x100C / 0x100D guard time (ms) / life-time factor. DS-301 declares
+        // both `readWrite` (`DS301_profile.xpd:772,779`) and CANopenNode's
+        // slave consumes them for node guarding (`CO_Node_Guarding.c:94-152`),
+        // so they are writable and consumed by the guarding RTR responder and
+        // the slave-side life-time supervision in `Node` (docs/DESIGN-DECISIONS.md NMT-02 /
+        // NMT-03).
         od.insert(
             Address::new(0x100C, 0),
             Entry::new(
                 "Guard time",
                 DataType::Unsigned16,
-                AccessType::Ro,
+                AccessType::Rw,
                 Storage::Value(Value::Uint(0)),
             ),
         );
@@ -161,7 +199,7 @@ impl StandardObjects {
             Entry::new(
                 "Life time factor",
                 DataType::Unsigned8,
-                AccessType::Ro,
+                AccessType::Rw,
                 Storage::Value(Value::Uint(0)),
             ),
         );
@@ -191,9 +229,15 @@ impl StandardObjects {
             ),
         );
 
-        // 0x1008/0x1009 Manufacturer device/hardware version — CiA 301
-        // mandatory strings (CANopenNode `CO_ODinterface.h` lists them as
-        // required); application may overwrite via the dictionary.
+        // 0x1008/0x1009/0x100A manufacturer device name / hardware version /
+        // software version — the three standard communication-area strings of
+        // DS-301 (`DS301_profile.xpd:754-766`, `UID_OBJ_1008/1009/100A`).
+        // docs/DESIGN-DECISIONS.md OD-02: the previous comment claimed CANopenNode
+        // `CO_ODinterface.h:55-80` lists them as *required*, which that header
+        // does not do (it is the plain standard-index enumeration, 0x100A at
+        // `:67`); the only mandatory communication objects are 0x1000, 0x1001,
+        // 0x1017 and 0x1018. Application may overwrite the values via the
+        // dictionary.
         od.insert(
             Address::new(0x1008, 0),
             Entry::new(
@@ -207,6 +251,17 @@ impl StandardObjects {
             Address::new(0x1009, 0),
             Entry::new(
                 "Manufacturer hardware version",
+                DataType::VisibleString,
+                AccessType::Ro,
+                Storage::Value(Value::Str(String::new())),
+            ),
+        );
+        // docs/DESIGN-DECISIONS.md OD-02: 0x100A was missing from the baseline although DS-301
+        // lists the three strings side by side.
+        od.insert(
+            Address::new(0x100A, 0),
+            Entry::new(
+                "Manufacturer software version",
                 DataType::VisibleString,
                 AccessType::Ro,
                 Storage::Value(Value::Str(String::new())),
@@ -250,31 +305,56 @@ impl StandardObjects {
             );
         }
 
-        // 0x1280 SDO client parameter (CiA 301 / DS301_profile.eds) —
-        // read-only skeleton: the default server request COB-ID. The stack
-        // has no OD-driven SDO client yet; exposed so masters inspecting
-        // the communication area find the expected object.
+        // 0x1280 SDO client parameter (CiA 301 / `DS301_profile.eds:612-652`):
+        // a **three**-entry record — sub1 COB-ID client→server, sub2 COB-ID
+        // server→client, sub3 the SDO server's node-id — with `SubNumber=4`
+        // (sub0 counts sub1..3) and all three values `rw`.
+        // docs/DESIGN-DECISIONS.md OD-01: the baseline used to expose a single read-only sub1,
+        // so a master walking the DCF record got subindex-missing for
+        // 0x1280:2/3 and `0x0601_0002` for a write to 0x1280:1.
         od.insert(
             Address::new(0x1280, 0),
             Entry::new(
                 "Highest sub-index supported",
                 DataType::Unsigned8,
                 AccessType::Const,
-                Storage::Value(Value::Uint(1)),
+                Storage::Value(Value::Uint(3)),
             ),
         );
-        // Default follows the builder's node-id-1 convention (like 0x1005 =
-        // 0x81): 0x600 + 1. A bare 0x600 placeholder would never match the
-        // shape-guarded renumbering on node-id changes (`BUGS.md` P2-2).
-        od.insert(
-            Address::new(0x1280, 1),
-            Entry::new(
+        // Defaults follow the builder's node-id-1 convention (like 0x1005 =
+        // 0x81): 0x600 + 1 and 0x580 + 1. A bare 0x600/0x580 placeholder would
+        // never match the shape-guarded renumbering on node-id changes
+        // (`docs/DESIGN-DECISIONS.md` P2-2 / P3-38).
+        for (sub, name, data_type, value) in [
+            (
+                1u8,
                 "COB-ID client to server (SDO)",
                 DataType::Unsigned32,
-                AccessType::Ro,
-                Storage::Value(Value::Uint(0x601)),
+                0x601u64,
             ),
-        );
+            (
+                2,
+                "COB-ID server to client (SDO)",
+                DataType::Unsigned32,
+                0x581,
+            ),
+            // docs/DESIGN-DECISIONS.md OD-04: sub3 is **UNSIGNED8** with default 1 in DS-301
+            // (`[1280sub3] DataType=0x0005, DefaultValue=0x01`,
+            // `DS301_profile.eds:648-652`). Declaring it U32 made a DCF
+            // write of the profile's one byte abort `0x0607_0007`
+            // (`TypeMismatchLengthLow`) where the reference accepts.
+            (3, "Node-ID of the SDO server", DataType::Unsigned8, 1),
+        ] {
+            od.insert(
+                Address::new(0x1280, sub),
+                Entry::new(
+                    name,
+                    data_type,
+                    AccessType::Rw,
+                    Storage::Value(Value::Uint(value)),
+                ),
+            );
+        }
 
         // 0x1018 Identity object — mandatory record, ro subentries.
         od.insert(
@@ -350,9 +430,14 @@ mod tests {
         for addr in [
             Address::new(0x1008, 0),
             Address::new(0x1009, 0),
+            // docs/DESIGN-DECISIONS.md OD-02
+            Address::new(0x100A, 0),
             Address::new(0x1015, 0),
             Address::new(0x1016, 0),
+            // docs/DESIGN-DECISIONS.md OD-01: the full three-entry 0x1280 record.
             Address::new(0x1280, 1),
+            Address::new(0x1280, 2),
+            Address::new(0x1280, 3),
         ] {
             assert!(od.entry(addr).is_some(), "{addr:?} missing");
         }
@@ -360,6 +445,30 @@ mod tests {
         for sub in 1..=4u8 {
             assert_eq!(od.read(Address::new(0x1016, sub)).unwrap(), Value::Uint(0));
         }
+        // docs/DESIGN-DECISIONS.md OD-01: sub0 = 3 and all three subentries are writable, as
+        // DS-301 declares (`[1280sub0] DefaultValue=0x03`, `AccessType=rw`).
+        assert_eq!(od.read(Address::new(0x1280, 0)).unwrap(), Value::Uint(3));
+        for sub in 1..=3u8 {
+            assert_eq!(
+                od.entry(Address::new(0x1280, sub)).unwrap().access,
+                AccessType::Rw,
+                "0x1280:{sub} must be rw"
+            );
+        }
+        assert_eq!(
+            od.read(Address::new(0x1280, 1)).unwrap(),
+            Value::Uint(0x601)
+        );
+        assert_eq!(
+            od.read(Address::new(0x1280, 2)).unwrap(),
+            Value::Uint(0x581)
+        );
+        assert_eq!(od.read(Address::new(0x1280, 3)).unwrap(), Value::Uint(1));
+        assert_eq!(
+            od.entry(Address::new(0x1280, 3)).unwrap().data_type,
+            DataType::Unsigned8,
+            "DS-301 declares 0x1280:3 as UNSIGNED8"
+        );
     }
 
     #[test]

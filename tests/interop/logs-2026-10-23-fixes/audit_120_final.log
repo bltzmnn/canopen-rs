@@ -1,0 +1,25 @@
+RESULT EDS-30-A1-header-key-first-delete PASS sub0=Ok(Uint(1)) warnings=[]
+RESULT EDS-30-A1b-with-other-sub-no-warning PASS sub0=Ok(Uint(1)) sub1=Ok(Uint(2)) warnings=[]
+RESULT EDS-30-A2-header-object-first PASS sub0=Ok(Uint(1)) warnings=[]
+RESULT EDS-30-B1-explicit-complete-header-object-first PASS sub0=Ok(Uint(1)) warnings=[]
+RESULT EDS-30-B3-explicit-complete-header-key-first PASS sub0=Ok(Uint(1)) warnings=[]
+RESULT EDS-30-B3p-type-drift PASS sub0=Ok(Uint(1)) dt=Some(Unsigned8) warnings=[]
+RESULT EDS-30-B3a-access-drift PASS sub0=Ok(Uint(1)) dt=Some(Unsigned8) access=Some(Const) warnings=[]
+RESULT EDS-31-compact-after-inline PASS sub0=Ok(Uint(3)) sub1=Ok(Uint(9)) warnings=[] compact=Some(3)
+RESULT EDS-32-node-relative-param-value PASS value=Ok(Uint(517)) warnings=[]
+RESULT EDS-33-node-relative-default-warning PASS value=Ok(Uint(517)) warnings=[]
+RESULT EDS-34-lenient-time-zero PASS value=Bytes([0, 0, 0, 0, 0, 0]) encode=Ok(6) warnings=["EDS entry [0x2000:0] dropped default (length mismatch: declared 6, actual 0); using zero value"]
+RESULT EDS-35-unicode-default PASS value=Bytes([104, 0, 233, 0, 108, 0, 108, 0, 111, 0])
+RESULT EDS-36-int64-node-relative PASS runtime=Err(ValueOutOfRange { value: 9223372036854775807, min: -9223372036854775808, max: 9223372036854775807 }) codegen_has_overflow_panic=true
+RESULT EDS-37-int24-bad-default PASS build=Err(ValueOutOfRange { value: 0, min: -8388608, max: 8388607 }) warnings=["invalid DefaultValue \"abc\" at [0x2000sub0]"]
+RESULT EMC-19 PASS with_pending_emcy_frames=[TxFrame { cob_id: 1797, data: [127, 0, 0, 0, 0, 0, 0, 0], len: 1 }] hb=1 emcy=0; without_emcy_hb=1 hb_cfg=Ok(Uint(100)) state=PreOperational control_frames=[TxFrame { cob_id: 1797, data: [127, 0, 0, 0, 0, 0, 0, 0], len: 1 }]
+RESULT EMC-20 PASS first=[[80, 130, 16, 23, 248, 42, 0, 0]] after_stop_start=[[0, 0, 0, 23, 248, 42, 0, 0], [80, 130, 16, 23, 248, 42, 0, 0]] late_reset=[[0, 0, 0, 23, 248, 42, 0, 0], [80, 130, 16, 23, 16, 39, 0, 0]] error_register=Ok(Uint(16))
+RESULT NMT-16 PASS state=Operational start_out=[(1797, [0])] boot_after=None poll_frames=[] lost_frames=[133] hb_events=[Started { node: NodeId(9) }, StateChanged { node: NodeId(9), new_state: Operational }, Lost { node: NodeId(9) }] cfg=Ok(Uint(589834))
+RESULT NMT-17 PASS err_free_state=Operational frames=[TxFrame { cob_id: 385, data: [17, 17, 17, 17, 0, 0, 0, 0], len: 4 }]; direct_frames=[TxFrame { cob_id: 385, data: [17, 17, 17, 17, 0, 0, 0, 0], len: 4 }]
+RESULT NMT-18 PASS emcy=None events=[] cfg=Ok(Uint(2752522)) rank42=Some(1)
+RESULT PDO-30 PASS writes=[(Address { index: 6656, subindex: 0 }, Ok(())), (Address { index: 6656, subindex: 1 }, Ok(())), (Address { index: 6656, subindex: 2 }, Ok(())), (Address { index: 6656, subindex: 3 }, Ok(())), (Address { index: 6656, subindex: 0 }, Err(SDO aborted: number and length of the objects to be mapped would exceed PDO length (0x06040042)))] config_errors=[Other("TPDO is enabled but its mapping record has zero entries"), Other("TPDO is enabled but its mapping record has zero entries"), Other("TPDO is enabled but its mapping record has zero entries"), Other("TPDO is enabled but its mapping record has zero entries"), Other("TPDO is enabled but its mapping record has zero entries"), Other("TPDO is enabled but its mapping record has zero entries")]
+RESULT PDO-31 PASS order=[385, 641] all=[385, 641]
+RESULT PDO-32 PASS missing_tpdo=ObjectDoesNotExist { index: 30583, subindex: 0 }/abort=Some(ObjectDoesNotExist); nonmappable_tpdo=SdoAborted(ObjectCannotBeMapped)/abort=Some(ObjectCannotBeMapped); nonmappable_rpdo=SdoAborted(ObjectCannotBeMapped)/abort=Some(ObjectCannotBeMapped); duplicate=SdoAborted(ObjectCannotBeMapped)/abort=Some(ObjectCannotBeMapped); type_mismatch=TypeMismatch { addr: Address { index: 8199, subindex: 0 }, expected: Unsigned8, actual: Unsigned8 }/abort=Some(TypeMismatch)
+RESULT LSS-13-nonconfigured-pending PASS pending=9 active=255 response=None
+RESULT LSS-14-dropped-sixth-frame PASS retry1=true retry2=true after_clear=true
+RESULT GTW-30-sequence-overflow PASS huge=Request sequence=4294967295 action=Read { node: 4, index: 4096, sub: 0, data_type: Hex }; neg=Request sequence=4294967295 action=Read { node: 4, index: 4096, sub: 0, data_type: Hex }; u32max=Request sequence=4294967295 action=Read { node: 4, index: 4096, sub: 0, data_type: Hex }; u64max=other=Respond("[4294967295] ERROR:101"); u64max_fresh=other=Respond("[0] ERROR:101")

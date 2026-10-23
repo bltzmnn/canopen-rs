@@ -9,7 +9,7 @@ pub mod client;
 pub mod codegen;
 pub mod eds;
 pub mod error;
-// BUGS.md 十M15: `sdo_exchange` drives the SocketCAN transports and imports
+// docs/DESIGN-DECISIONS.md 十M15: `sdo_exchange` drives the SocketCAN transports and imports
 // `crate::transport`, which only exists on Linux — gating it keeps
 // `eds`/`codegen`/`storage` cross-platform buildable as documented.
 #[cfg(target_os = "linux")]

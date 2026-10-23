@@ -6,10 +6,12 @@
 //!
 //! [`SocketCan::sdo_read`] / [`SocketCan::sdo_write`] run a whole SDO
 //! transaction per call (expedited/segmented/block chosen automatically),
-//! with one timeout retry per call and a *fresh* deadline for each attempt,
-//! mapping aborts onto [`HostError::SdoAborted`]
-//! (docs/IMPLEMENTATION.md §5.6; the deadline reset on retry is intentional,
-//! `BUGS.md` #33).
+//! mapping aborts onto [`HostError::SdoAborted`] (docs/IMPLEMENTATION.md
+//! §5.6). The deadline is a **per-response window**: it re-anchors on every
+//! response and imposes no total-transaction cap (`docs/DESIGN-DECISIONS.md` API-01).
+//! Timeout replay is also per-kind: reads and block downloads retry once,
+//! expedited/segmented writes never re-send because a lost response must not
+//! repeat their side effects (`docs/DESIGN-DECISIONS.md` S2/HOST-03).
 
 use socketcan::Socket as _;
 use std::io::ErrorKind;
@@ -17,15 +19,38 @@ use std::time::{Duration, Instant};
 
 use canopen_core::datatypes::{DataType, Value};
 use canopen_core::nmt::NmtCommand;
-use canopen_core::node::Node;
+use canopen_core::node::{CanStatus, Node};
 use canopen_core::types::Address;
 
 use crate::error::HostError;
 
-/// Default deadline for one complete SDO transaction.
+/// Default deadline for **one response** of an SDO transaction.
+///
+/// The window is re-anchored on every response (the drive macro re-computes
+/// `window` per awaited frame, `sdo_exchange.rs:315-321`), so a
+/// long multi-frame transfer has no overall time limit — the same per-response
+/// semantics python-canopen's `RESPONSE_TIMEOUT` has (`sdo/client.py:23`,
+/// docs/DESIGN-DECISIONS.md API-01).
 pub const SDO_DEADLINE: Duration = Duration::from_millis(1_000);
 
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(20);
+
+/// Single source for the `CanState → CanStatus` mapping used by both
+/// transports.
+pub(crate) fn can_status_from_state(state: socketcan::nl::CanState) -> CanStatus {
+    use socketcan::nl::CanState;
+    match state {
+        CanState::BusOff => CanStatus {
+            bus_off: true,
+            bus_warn: false,
+        },
+        CanState::ErrorWarning | CanState::ErrorPassive => CanStatus {
+            bus_off: false,
+            bus_warn: true,
+        },
+        CanState::ErrorActive | CanState::Stopped | CanState::Sleeping => CanStatus::default(),
+    }
+}
 
 /// Maps a core SDO error to the host error it represents. Server aborts
 /// surface as [`HostError::SdoAborted`] carrying the abort code; everything
@@ -37,7 +62,7 @@ pub(crate) fn sdo_error(err: canopen_core::types::Error) -> HostError {
     }
 }
 
-/// Shared SDO-response predicate (BUGS.md M5): SDO segments are always
+/// Shared SDO-response predicate (docs/DESIGN-DECISIONS.md M5): SDO segments are always
 /// exactly 8 bytes (CANopenNode `CO_SDOclient.c` / `CO_SDOserver.c` check
 /// `DLC == 8U`), so a short frame is malformed on the wire and must not be
 /// zero-padded into a valid-looking response. Both transports call this —
@@ -115,6 +140,7 @@ pub fn now_ms() -> u64 {
 /// Blocking SocketCAN socket.
 pub struct SocketCan {
     sock: socketcan::CanSocket,
+    interface: String,
 }
 
 impl SocketCan {
@@ -134,7 +160,22 @@ impl SocketCan {
                 HostError::Io(e)
             }
         })?;
-        Ok(Self { sock })
+        let interface = interface.to_string();
+        Ok(Self { sock, interface })
+    }
+
+    /// Best-effort query of the controller state for LED/NMT inputs.
+    ///
+    /// Returns `None` when the kernel's netlink state cannot be read (or the
+    /// driver does not expose it); the caller may keep the previous status.
+    /// This is intentionally advisory: `core` never reads the controller.
+    #[must_use]
+    pub fn can_status(&self) -> Option<CanStatus> {
+        let state = socketcan::nl::CanInterface::open(&self.interface)
+            .ok()?
+            .state()
+            .ok()??;
+        Some(can_status_from_state(state))
     }
 
     /// Sends one classic data frame.
@@ -188,7 +229,7 @@ impl SocketCan {
         self.recv(Duration::from_millis(5))
     }
 
-    // 算法体由 `sdo_exchange` 的 `drive_exchange_body!` 提供（BUGS.md m12）。
+    // 算法体由 `sdo_exchange` 的 `drive_exchange_body!` 提供（docs/DESIGN-DECISIONS.md m12）。
     fn drive_exchange(
         &mut self,
         mut ex: crate::sdo_exchange::Exchange,
@@ -262,7 +303,7 @@ mod tests {
 
     #[test]
     fn server_abort_surfaces_with_its_code() {
-        // BUGS.md M1: `HostError::SdoAborted` was never constructed — aborts
+        // docs/DESIGN-DECISIONS.md M1: `HostError::SdoAborted` was never constructed — aborts
         // were swallowed by the generic `From<core::Error>` conversion and
         // the gateway mapping became dead code.
         let err = sdo_error(canopen_core::types::Error::SdoAborted(

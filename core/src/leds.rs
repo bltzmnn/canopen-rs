@@ -8,6 +8,12 @@
 //! - **single/double/triple/quadruple flash**: burst of 1–4 pulses every
 //!   1.2/1.6/2.0/2.4 s respectively, alternating red/green within each pulse
 //!
+//! **Adjudicated divergence**: the flicker phase flips on every 50 ms *tick*
+//! inside one call, while CANopenNode commits `LEDred` once per
+//! `CO_LEDs_process` *call* — callers driving ≥ its own slice size (e.g. one
+//! tick per call) are byte-identical; a caller passing a larger delta keeps
+//! the CiA 303-3 10 Hz alternation here. This stack's choice is intentional.
+//!
 //! Priority chains (first match wins):
 //!
 //! ```text
@@ -34,9 +40,9 @@ const CANOPEN: u8 = 0x80;
 
 /// Input snapshot for one [`Leds::process`] call.
 /// Overall visible period of the LED timing state machine (ms): the LCM of
-/// flicker 100 ms, blink 800 ms and the flash bursts 1200/1600/2000 ms is
-/// 24 s — 4.8 s was wrong because flash_3 does not divide it
-/// (`BUGS.md` R10-P2-14).
+/// flicker 100 ms, blink 400 ms (200 ms on / 200 ms off) and the flash bursts
+/// 1.2/1.6/2.0/2.4 s is 24 s — 4.8 s was wrong because flash_3 does not
+/// divide it (`docs/DESIGN-DECISIONS.md` R10-P2-14/LED-03).
 const LED_STATE_PERIOD_MS: u32 = 24000;
 
 /// Per-tick error inputs to the CiA 303-3 state machine.
@@ -84,6 +90,7 @@ pub struct Leds {
     flicker_red: bool,
     red: u8,
     green: u8,
+    output: LedOutput,
 }
 
 impl Default for Leds {
@@ -94,12 +101,12 @@ impl Default for Leds {
 
 /// Reduces an elapsed-time delta to the LED state machine's overall visible
 /// period. Every internal timer is periodic with a period dividing 24 s
-/// (flicker 100 ms, blink 800 ms, flash bursts 1.2/1.6/2.0/2.4 s), so a delta
+/// (flicker 100 ms, blink 400 ms, flash bursts 1.2/1.6/2.0/2.4 s), so a delta
 /// reduced modulo that period produces byte-identical outputs while capping
 /// the tick loop — a single call with `u32::MAX` ms previously spun ~86
-/// million iterations (`BUGS.md` P3-47). 24 s is the least common multiple
+/// million iterations (`docs/DESIGN-DECISIONS.md` P3-47). 24 s is the least common multiple
 /// of every flash period (4.8 s was too short for flash_3's 2.0 s cycle,
-/// `BUGS.md` R10-P2-14).
+/// `docs/DESIGN-DECISIONS.md` R10-P2-14).
 fn reduce_elapsed(elapsed_ms: u64) -> u32 {
     let capped = elapsed_ms.min(u64::from(u32::MAX)) as u32;
     capped % LED_STATE_PERIOD_MS
@@ -119,6 +126,10 @@ impl Leds {
             flicker_red: false,
             red: 0,
             green: 0,
+            output: LedOutput {
+                green_on: false,
+                red_on: false,
+            },
         }
     }
 
@@ -136,7 +147,9 @@ impl Leds {
             ticked = true;
             self.acc_ms -= 50;
             // The flicker phase flips every 50 ms tick, so multi-tick
-            // process() calls keep the 10 Hz alternation (CiA 303-3).
+            // process() calls keep the 10 Hz alternation (CiA 303-3) — the
+            // intentional divergence from the reference's per-call phase
+            // commit, documented at the module head (`docs/DESIGN-DECISIONS.md` LED-02).
             self.flicker_red = !self.flicker_red;
 
             self.tmr_200ms += 1;
@@ -241,10 +254,18 @@ impl Leds {
             self.green = gr;
         }
 
-        LedOutput {
+        let out = LedOutput {
             green_on: self.green & CANOPEN != 0,
             red_on: self.red & CANOPEN != 0,
-        }
+        };
+        self.output = out;
+        out
+    }
+
+    /// Latest output computed by [`Self::process`].
+    #[must_use]
+    pub const fn output(&self) -> LedOutput {
+        self.output
     }
 }
 
@@ -372,7 +393,7 @@ mod tests {
 
     #[test]
     fn flicker_phase_advances_within_multi_tick_process() {
-        // BUGS.md M9: one process() call covering several 50 ms ticks must
+        // docs/DESIGN-DECISIONS.md M9: one process() call covering several 50 ms ticks must
         // still flip the flicker phase per tick (10 Hz alternation).
         let mut leds = Leds::new();
         let inputs = LedInputs {

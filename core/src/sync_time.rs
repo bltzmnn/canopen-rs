@@ -39,7 +39,8 @@ pub fn decode_sync(data: &[u8]) -> Option<Option<u8>> {
 /// A decoded TIME stamp: absolute UTC time as `(unix_ms)` plus the raw parts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeStamp {
-    /// Milliseconds within the day (`0..=86_399_999`).
+    /// Milliseconds within the day, restricted to the 28-bit TIME_OF_DAY
+    /// domain (`0..=0x0FFF_FFFF`; `decode` masks the reserved high nibble).
     pub ms_of_day: u32,
     /// Days since 1984-01-01.
     pub days_since_1984: u16,
@@ -47,15 +48,29 @@ pub struct TimeStamp {
 
 impl TimeStamp {
     /// Encodes the six-byte TIME payload.
+    ///
+    /// docs/DESIGN-DECISIONS.md SYN-09 ③: only the low 28 bits of TIME_OF_DAY are defined
+    /// (CiA 301; CANopenNode masks on receive, `CO_TIME.c:163`), so the
+    /// reserved high nibble is forced to zero on the wire instead of being
+    /// echoed back as received.
     #[must_use]
     pub fn encode(&self) -> [u8; 8] {
         let mut out = [0u8; 8];
-        out[..4].copy_from_slice(&self.ms_of_day.to_le_bytes());
+        out[..4].copy_from_slice(&(self.ms_of_day & 0x0FFF_FFFF).to_le_bytes());
         out[4..6].copy_from_slice(&self.days_since_1984.to_le_bytes());
         out
     }
 
     /// Decodes the six-byte TIME payload.
+    ///
+    /// docs/DESIGN-DECISIONS.md SYN-09 ③: TIME_OF_DAY's reserved high 4 bits are masked off
+    /// exactly like CANopenNode (`CO_TIME.c:163`,
+    /// `CO_SWAP_32(ms_swapped) & 0x0FFFFFFFU`), so a producer that leaves them
+    /// set cannot push `ms_of_day` outside the 28-bit domain. The remaining
+    /// fields are **not** range-checked (a day of 86 400 000 ms and a
+    /// `days` value are both accepted and passed to the application), matching
+    /// the reference, which only checks the payload length
+    /// (`CO_TIME.c:39-49`).
     ///
     /// # Errors
     /// [`Error::BadLength`] unless exactly six bytes are supplied.
@@ -67,7 +82,7 @@ impl TimeStamp {
             });
         }
         Ok(Self {
-            ms_of_day: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            ms_of_day: u32::from_le_bytes([data[0], data[1], data[2], data[3]]) & 0x0FFF_FFFF,
             days_since_1984: u16::from_le_bytes([data[4], data[5]]),
         })
     }

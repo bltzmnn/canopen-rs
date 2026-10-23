@@ -1,5 +1,5 @@
 //! Transport-agnostic SDO transaction core shared by the blocking and tokio
-//! transports (`BUGS.md` m12): one implementation of client lifecycle,
+//! transports (`docs/DESIGN-DECISIONS.md` m12): one implementation of client lifecycle,
 //! outgoing queue management, protocol-error ABORT transmission and
 //! terminal-event interpretation. The two transports only supply
 //! send/receive primitives.
@@ -12,6 +12,21 @@ use canopen_core::types::{Address, NodeId};
 
 use crate::error::HostError;
 use crate::transport::sdo_error;
+
+/// Whether an abort of the *block* transfer justifies retrying the read with
+/// the segmented path (`docs/DESIGN-DECISIONS.md` EDS-04).
+///
+/// Only "this server cannot do block transfer" codes qualify. Everything else
+/// — a missing object, an illegal state, a device-specific refusal — is a
+/// definitive answer that must surface instead of costing a second
+/// transaction (python-canopen's `upload()` is a single transaction too).
+pub(crate) fn block_fallback_worthwhile(code: canopen_core::sdo::SdoAbortCode) -> bool {
+    use canopen_core::sdo::SdoAbortCode as A;
+    matches!(
+        code,
+        A::InvalidCommandSpecifier | A::InvalidBlockSize | A::UnsupportedAccess | A::GeneralError
+    )
+}
 
 /// How a driven transaction ended.
 #[derive(Debug)]
@@ -31,14 +46,22 @@ pub struct Exchange {
     queue: VecDeque<[u8; 8]>,
     /// Frames that must go out before the exchange may end: protocol-error
     /// ABORTs queued by the client and unconfirmed block-end trailing
-    /// frames. Buffered so they survive even an error return (`BUGS.md`
+    /// frames. Buffered so they survive even an error return (`docs/DESIGN-DECISIONS.md`
     /// P1-1).
     pending_extra: Vec<[u8; 8]>,
     rx_cob: u16,
     tx_cob: u16,
-    /// How to rebuild this transaction after a timeout retry (`BUGS.md`
+    /// How to rebuild this transaction after a timeout retry (`docs/DESIGN-DECISIONS.md`
     /// P1-2).
     op: Op,
+    /// Whether a whole-transaction timeout replay is safe. Reads and block
+    /// uploads are idempotent; expedited/segmented writes are not — if the
+    /// first attempt reached the server and only the response was lost,
+    /// replaying repeats the side effect (e.g. 0x1010 save, an incrementing
+    /// counter), which neither python-canopen (abort + raise) nor
+    /// CANopenNode (no retry) does (`docs/DESIGN-DECISIONS.md` S2). Block downloads keep the
+    /// single retry because the L9 ruling explicitly preserves it.
+    replay_on_timeout: bool,
 }
 
 /// The transaction kind, kept so [`Exchange::restart`] can replay it.
@@ -51,6 +74,10 @@ enum Op {
 
 impl Exchange {
     fn new(client: SdoClient, first: Vec<[u8; 8]>, node: u8, op: Op) -> Self {
+        let replay_on_timeout = match &op {
+            Op::Read { .. } | Op::ReadBlock { .. } => true,
+            Op::Write { data, .. } => data.len() > canopen_core::sdo::BLOCK_THRESHOLD,
+        };
         Self {
             client,
             queue: first.into(),
@@ -58,7 +85,15 @@ impl Exchange {
             rx_cob: request_cob_id(node),
             tx_cob: response_cob_id(node),
             op,
+            replay_on_timeout,
         }
+    }
+
+    /// Whether the timeout path may replay the transaction from its
+    /// initiate frame (`docs/DESIGN-DECISIONS.md` S2/P1-2).
+    #[must_use]
+    pub const fn replay_on_timeout(&self) -> bool {
+        self.replay_on_timeout
     }
 
     fn begin(op: &Op) -> Result<(SdoClient, Vec<[u8; 8]>), HostError> {
@@ -66,7 +101,7 @@ impl Exchange {
         let first = match op {
             Op::Read { addr, dt } => client.read(*addr, *dt),
             Op::ReadBlock { addr, dt } => client.read_block(*addr, *dt),
-            // BUGS.md L5: re-framing the same payload cannot fail in
+            // docs/DESIGN-DECISIONS.md L5: re-framing the same payload cannot fail in
             // practice (it was already framed in `Exchange::write`), but a
             // silent `unwrap_or_default()` would mask a genuine framing bug
             // with an empty queue that just re-times-out. Fail fast instead.
@@ -81,7 +116,7 @@ impl Exchange {
     /// [`HostError::BadSdoNode`] when `node` is outside the valid 1..=127
     /// range (a raw `node` was previously folded into the request COB-ID,
     /// sending frames to a reserved/illegal channel; `send_nmt_body` already
-    /// validated via `NodeId::try_from`, `BUGS.md` H2).
+    /// validated via `NodeId::try_from`, `docs/DESIGN-DECISIONS.md` H2).
     pub fn read(node: u8, addr: Address, dt: DataType) -> Result<Self, HostError> {
         let node = NodeId::try_from(node)
             .map_err(|_| HostError::BadSdoNode)?
@@ -128,10 +163,10 @@ impl Exchange {
     }
 
     /// Resets the transaction to its initial state so the driver can retry
-    /// after a timeout (`BUGS.md` P1-2).
+    /// after a timeout (`docs/DESIGN-DECISIONS.md` P1-2).
     ///
     /// # Errors
-    /// [`HostError::Core`] when re-framing fails (`BUGS.md` L5: previously
+    /// [`HostError::Core`] when re-framing fails (`docs/DESIGN-DECISIONS.md` L5: previously
     /// the failure was masked by an empty queue that just re-timed-out).
     pub fn restart(&mut self) -> Result<(), HostError> {
         let (client, first) = Self::begin(&self.op)?;
@@ -172,12 +207,12 @@ impl Exchange {
     ///
     /// # Errors
     /// - [`HostError::SdoAborted`] when the server aborted (code preserved,
-    ///   BUGS.md M1);
+    ///   docs/DESIGN-DECISIONS.md M1);
     /// - I/O and protocol errors propagate.
     pub fn on_response(&mut self, resp: &[u8; 8]) -> Result<Progress, HostError> {
         // Run the state machine first, then collect aborts: an ABORT caused
         // by *this* very response must reach the wire before we give up
-        // (BUGS.md P1-1/M10).
+        // (docs/DESIGN-DECISIONS.md P1-1/M10).
         let result = self.client.on_response(resp).map_err(sdo_error);
         self.pending_extra.extend(self.client.take_pending_abort());
         Ok(match result? {
@@ -235,7 +270,7 @@ macro_rules! suspend {
 
 /// 驱动一个 SDO 事务（`Exchange`）到完成（阻塞/异步共用算法体）。
 ///
-/// 调度规则（`BUGS.md` P0-3/P1-1/P1-2）：
+/// 调度规则（`docs/DESIGN-DECISIONS.md` P0-3/P1-1/P1-2）：
 /// 1. 每轮**排空整个发送队列**（block download 一次排队 ≤127 个 segment，
 ///    服务端收满子块才应答，不能"发一帧等一帧"）；
 /// 2. 然后等**一帧**响应——block upload 的中间段不产生新请求帧，
@@ -246,7 +281,7 @@ macro_rules! drive_exchange_body {
     ($self:ident, $ex:ident, $deadline:expr, $mode:ident) => {{
         use $crate::error::HostError;
         use $crate::sdo_exchange::Progress;
-        // BUGS.md 八M8: the deadline is a *per-response* window, not a budget
+        // docs/DESIGN-DECISIONS.md 八M8: the deadline is a *per-response* window, not a budget
         // for the whole transaction. python-canopen (`sdo/client.py:23,77`)
         // and CANopenNode (`CO_SDOclient.c`, timer cleared on every frame)
         // both enforce a per-response timeout with no total-transaction
@@ -257,7 +292,7 @@ macro_rules! drive_exchange_body {
         // every response wait below.
         let window = $deadline.saturating_duration_since(std::time::Instant::now());
         let mut retried = false;
-        // BUGS.md H1: 新事务起点（发出首帧前）先排空本节点 cmd 套接字上的
+        // docs/DESIGN-DECISIONS.md H1: 新事务起点（发出首帧前）先排空本节点 cmd 套接字上的
         // 陈旧响应，与 python-canopen `request_response` 在每次调用开头清空
         // 队列一致（§5.6 旧注释只覆盖了超时重试路径）。否则跨对象复用同一个
         // node 的 cmd 套接字、或 `read_domain_bytes` 的 block→分段两次独立
@@ -265,7 +300,7 @@ macro_rules! drive_exchange_body {
         // `SdoClient::on_response`，造成状态错乱（UnexpectedFrame 等）。
         // 2ms 有界窗口——窗口到期后迟到响应与 python-canopen 一样按竞争处理。
         let drain_until = std::time::Instant::now() + std::time::Duration::from_millis(2);
-        // BUGS.md 八Q10: only a *timeout* ends the drain window — a real IO
+        // docs/DESIGN-DECISIONS.md 八Q10: only a *timeout* ends the drain window — a real IO
         // error (interface down etc.) must surface instead of being silently
         // discarded with `.is_ok()`.
         loop {
@@ -302,19 +337,19 @@ macro_rules! drive_exchange_body {
                         return Ok(progress);
                     }
                 }
-                Err(HostError::Timeout) if !retried => {
+                Err(HostError::Timeout) if !retried && $ex.replay_on_timeout() => {
                     retried = true;
                     if let Some(abort) =
                         $ex.abort_with(canopen_core::sdo::SdoAbortCode::ProtocolTimeout)
                     {
                         $crate::sdo_exchange::suspend!($mode $self.send($ex.request_cob(), &abort))?;
                     }
-                    // BUGS.md L5: re-framing cannot fail here (the payload
+                    // docs/DESIGN-DECISIONS.md L5: re-framing cannot fail here (the payload
                     // was framed successfully in `Exchange::write`), but a
                     // failure must surface rather than silently retry with
                     // an empty queue.
                     $ex.restart()?;
-                    // §5.6 stale-response hygiene (BUGS.md P2-10): the peer
+                    // §5.6 stale-response hygiene (docs/DESIGN-DECISIONS.md P2-10): the peer
                     // may still be streaming replies to the abandoned
                     // transaction, so drain everything queued in a short
                     // 2 ms bounded window before restarting — a late response
@@ -323,7 +358,7 @@ macro_rules! drive_exchange_body {
                     // response arriving after it races the retry exactly as
                     // in python-canopen (it clears the queue only at the
                     // send point), so this is a documented known limitation
-                    // (BUGS.md #12), not a silent corruption path.
+                    // (docs/DESIGN-DECISIONS.md #12), not a silent corruption path.
                     let drain_until =
                         std::time::Instant::now() + std::time::Duration::from_millis(2);
                     loop {
@@ -331,15 +366,35 @@ macro_rules! drive_exchange_body {
                             $self.recv_response($ex.response_cob(), drain_until)
                         ) {
                             Ok(_stale) => continue,
-                            Err(_) => break,
+                            // docs/DESIGN-DECISIONS.md N8: same rule as the transaction-start
+                            // drain above (八Q10) — only a timeout ends the
+                            // window; a real IO error must surface instead
+                            // of being silently dropped.
+                            Err(HostError::Timeout) => break,
+                            Err(e) => return Err(e),
                         }
                     }
                     // No deadline reset needed: the per-response window is
-                    // re-armed at every `recv_response` call (BUGS.md 八M8),
+                    // re-armed at every `recv_response` call (docs/DESIGN-DECISIONS.md 八M8),
                     // so the retry automatically gets a full window (the
                     // pre-八M8 code reset the single absolute deadline here).
                 }
-                // BUGS.md #11: the retry also timed out. Release the peer's
+                // docs/DESIGN-DECISIONS.md S2: an expedited/segmented *write* is not replayed.
+                // The first attempt may already have been executed with only
+                // its response lost, so replaying would silently repeat the
+                // side effect. Release the peer with the same explicit ABORT
+                // and surface the timeout, matching python-canopen
+                // (abort + raise, `client.py:87,97-100`) and CANopenNode
+                // (no automatic retry).
+                Err(HostError::Timeout) if !retried => {
+                    if let Some(abort) =
+                        $ex.abort_with(canopen_core::sdo::SdoAbortCode::ProtocolTimeout)
+                    {
+                        $crate::sdo_exchange::suspend!($mode $self.send($ex.request_cob(), &abort))?;
+                    }
+                    return Err(HostError::Timeout);
+                }
+                // docs/DESIGN-DECISIONS.md #11: the retry also timed out. Release the peer's
                 // pending transaction with an explicit abort before giving
                 // up, exactly like python-canopen (`request_response`) and
                 // CANopenNode do when they abandon a transfer — otherwise
@@ -365,7 +420,7 @@ macro_rules! serve_node_body {
         if let Some(boot) = $node.boot() {
             $crate::sdo_exchange::suspend!($mode $self.send(boot.cob_id, boot.payload()))?;
         }
-        // Session timeout (§5.5 / BUGS.md P2-8): default 1500 ms unless the
+        // Session timeout (§5.5 / docs/DESIGN-DECISIONS.md P2-8): default 1500 ms unless the
         // application configured something explicitly.
         $node.set_sdo_timeout_if_unset(1500);
         while !$shutdown.load(Ordering::Relaxed) {
@@ -385,11 +440,11 @@ macro_rules! serve_node_body {
             // Only frames on the SDO request channel (0x600+node) count as
             // activity for the SDO session timer — unrelated heartbeats/PDOs/
             // SYNC must not keep a wedged transfer alive on a busy bus
-            // (BUGS.md #10, CANopenNode resets the timeout only on SDO
+            // (docs/DESIGN-DECISIONS.md #10, CANopenNode resets the timeout only on SDO
             // frames). `touch_sdo_activity` records activity whenever a
             // transfer is in flight.
             if let $crate::transport::Incoming::Data(rx) = &incoming {
-                // BUGS.md H2: use the node's *own* SDO RX COB-ID (single
+                // docs/DESIGN-DECISIONS.md H2: use the node's *own* SDO RX COB-ID (single
                 // source of truth) instead of re-deriving `0x600+node` here —
                 // core currently hardcodes the default channel (0x1200
                 // multi-channel is not implemented, docs/IMPLEMENTATION.md
@@ -413,7 +468,7 @@ macro_rules! serve_node_body {
             for tx in responses {
                 $crate::sdo_exchange::suspend!($mode $self.send(tx.cob_id, tx.payload()))?;
             }
-            // NMT reset re-initialisation (BUGS.md P2-2): ResetNode /
+            // NMT reset re-initialisation (docs/DESIGN-DECISIONS.md P2-2): ResetNode /
             // ResetCommunication put the node back into Initialising; CiA 301
             // requires it to re-enter PreOperational and emit boot-up on its
             // own. `boot()` is a no-op in every other state.
@@ -475,7 +530,7 @@ macro_rules! sdo_write_body {
 
 /// 读取大对象为字节（先 block 再回退分段；阻塞/异步共用算法体）。
 ///
-/// block 尝试失败的**回退策略**（`BUGS.md` H2）：
+/// block 尝试失败的**回退策略**（`docs/DESIGN-DECISIONS.md` H2）：
 /// - 服务端明确 ABORT（如不支持 block）→ 正常回退分段读取；
 /// - **超时** → 不再静默吞掉走分段（此前最坏延迟 2× `SDO_DEADLINE`，
 ///   且掩盖了「block 被拒」与「block 超时」的区分）——block 超时是
@@ -494,8 +549,15 @@ macro_rules! read_domain_bytes_body {
             }
             // 服务端明确拒绝 block：回退分段（正常路径，python-canopen
             // 服务端对不支持的 block 也是 abort）。
-            Err($crate::error::HostError::SdoAborted(_)) => {}
-            // block 超时/IO/协议错误：透传，不再掩盖（BUGS.md H2）。
+            //
+            // docs/DESIGN-DECISIONS.md EDS-04：只对「block 不可用」这一档回退。此前任何
+            // abort（含 `ObjectDoesNotExist` 等必现码）都回退分段，于是
+            // 读一个不存在的对象恒定花掉 2 次事务（python 的 `upload()`
+            // 单事务直达）；必现码直接透传，只有「协议/命令不被接受」
+            // 一类才值得再试一次。
+            Err($crate::error::HostError::SdoAborted(code))
+                if $crate::sdo_exchange::block_fallback_worthwhile(code) => {}
+            // block 超时/IO/协议错误：透传，不再掩盖（docs/DESIGN-DECISIONS.md H2）。
             Err(e) => return Err(e),
             // 非 Complete 终态（理论上只可能是 Done）不属于读取语义。
             Ok(_) => return Err($crate::error::HostError::ProtocolIncomplete),
@@ -513,7 +575,7 @@ macro_rules! read_domain_bytes_body {
     }};
 }
 
-// Crate-scoped re-exports (BUGS.md P3-60): `#[macro_export]` leaked these
+// Crate-scoped re-exports (docs/DESIGN-DECISIONS.md P3-60): `#[macro_export]` leaked these
 // into the public API where their `pub(crate)` dependencies made them
 // unusable from outside anyway.
 pub(crate) use drive_exchange_body;
@@ -526,7 +588,7 @@ pub(crate) use suspend;
 
 #[cfg(test)]
 mod tests {
-    //! 内存总线回归（`BUGS.md` P0-3/P1-1/P1-2）：host 宏 ↔ core `SdoServer`
+    //! 内存总线回归（`docs/DESIGN-DECISIONS.md` P0-3/P1-1/P1-2）：host 宏 ↔ core `SdoServer`
     //! 全直连，无 SocketCAN。覆盖 block 双向 >127 字节、block 被拒后的分段
     //! 回退、超时 ABORT+单次重试、协议违规补发 ABORT。
 
@@ -540,7 +602,40 @@ mod tests {
     use canopen_core::types::Address;
 
     use crate::error::HostError;
-    use crate::sdo_exchange::{Exchange, Progress};
+    use crate::sdo_exchange::{block_fallback_worthwhile, Exchange, Progress};
+
+    /// docs/DESIGN-DECISIONS.md HOST-05: the EDS-04 narrowing is only meaningful if the
+    /// predicate itself is pinned — without this, widening it back to "any
+    /// abort falls back to segmented" would keep every other test green.
+    #[test]
+    fn only_unsupported_block_codes_fall_back_to_segmented() {
+        use canopen_core::sdo::SdoAbortCode as A;
+        // "This server cannot do block transfer" — the reference client's
+        // equivalent (EDS-04): retry segmented and it may still work.
+        for code in [
+            A::InvalidCommandSpecifier,
+            A::InvalidBlockSize,
+            A::UnsupportedAccess,
+            A::GeneralError,
+        ] {
+            assert!(block_fallback_worthwhile(code), "{code:?} must fall back");
+        }
+        // Definitive answers: the object is missing, the state is wrong, the
+        // node refused — a second transaction only wastes a round trip and
+        // hides the real abort.
+        for code in [
+            A::ObjectDoesNotExist,
+            A::SubindexDoesNotExist,
+            A::DataCannotBeTransferred,
+            A::AccessDeniedDueToLocalControl,
+            A::HardwareError,
+        ] {
+            assert!(
+                !block_fallback_worthwhile(code),
+                "{code:?} must surface instead of falling back"
+            );
+        }
+    }
 
     const NODE: u8 = 2;
     const BLOB_ADDR: Address = Address::new(0x2500, 0);
@@ -589,6 +684,9 @@ mod tests {
         swallow_requests: u32,
         /// 翻转服务端上传 data segment 的 toggle 位（制造 ToggleBit 违规）。
         flip_segment_toggle: bool,
+        /// 让接下来 N 次 `recv_response` 返回 IO 错误（docs/DESIGN-DECISIONS.md N8：验证
+        /// 重试排空窗口不会吞掉真实 IO 错误）。
+        io_errors: u32,
     }
 
     /// host 宏的对端：真 core SdoServer + 可编程故障注入。
@@ -600,7 +698,7 @@ mod tests {
         /// host 发出的 ABORT 计数。
         aborts_sent: usize,
         /// 每次 `recv_response` 观察到的 deadline（用于验证逐响应重锚，
-        /// BUGS.md 八M8）。
+        /// docs/DESIGN-DECISIONS.md 八M8）。
         observed_deadlines: Vec<Instant>,
     }
 
@@ -657,6 +755,10 @@ mod tests {
 
         fn recv_response(&mut self, _tx_cob: u16, deadline: Instant) -> Result<[u8; 8], HostError> {
             self.observed_deadlines.push(deadline);
+            if self.faults.io_errors > 0 {
+                self.faults.io_errors -= 1;
+                return Err(HostError::Io(std::io::Error::other("injected IO error")));
+            }
             self.inbox.pop_front().ok_or(HostError::Timeout)
         }
 
@@ -701,7 +803,7 @@ mod tests {
 
     #[test]
     fn deadline_rearms_per_response_not_per_transaction() {
-        // BUGS.md 八M8: 多帧 block 事务的 deadline 必须逐响应重锚——旧实现
+        // docs/DESIGN-DECISIONS.md 八M8: 多帧 block 事务的 deadline 必须逐响应重锚——旧实现
         // 全程共用同一绝对时刻，长传输（如 64 KiB EDS）必然中途超时。
         let payload = blob();
         let mut bus = ScriptedBus::new(Faults::default());
@@ -740,7 +842,7 @@ mod tests {
 
     #[test]
     fn domain_read_propagates_block_timeout_instead_of_segmented_fallback() {
-        // BUGS.md H2: a block attempt that *times out* must surface the
+        // docs/DESIGN-DECISIONS.md H2: a block attempt that *times out* must surface the
         // timeout — the previous `if let Ok(Complete) … else segmented`
         // swallowed it and silently ran a second full transaction (up to 2×
         // SDO_DEADLINE latency, and no way to tell "block rejected" from
@@ -760,7 +862,7 @@ mod tests {
 
     #[test]
     fn exchange_constructors_reject_out_of_range_node() {
-        // BUGS.md H2: raw `node` used to be folded straight into
+        // docs/DESIGN-DECISIONS.md H2: raw `node` used to be folded straight into
         // `request_cob_id` — node > 127 sent SDO frames to a reserved COB.
         // All three constructors must reject 0 and 128.. like send_nmt_body.
         let addr = Address::new(0x1000, 0);
@@ -781,6 +883,42 @@ mod tests {
         // Valid ids still construct.
         assert!(Exchange::read(1, addr, DataType::Unsigned32).is_ok());
         assert!(Exchange::read(127, addr, DataType::Unsigned32).is_ok());
+    }
+
+    #[test]
+    fn write_timeout_is_not_replayed() {
+        // docs/DESIGN-DECISIONS.md S2: an expedited/segmented write must not be replayed
+        // after a timeout — the first attempt may have been executed with
+        // only its response lost, so a replay would silently repeat the
+        // side effect. The peer still gets the explicit release ABORT, but
+        // there is no second attempt (one ABORT, not two).
+        let mut bus = ScriptedBus::new(Faults {
+            swallow_requests: u32::MAX,
+            ..Faults::default()
+        });
+        let ex = Exchange::write(NODE, Address::new(0x2501, 0), &[1, 2, 3, 4]).expect("node");
+        let err = bus
+            .drive_exchange(ex, short_deadline(50))
+            .expect_err("silent peer must time out");
+        assert!(matches!(err, HostError::Timeout));
+        assert_eq!(bus.aborts_sent, 1, "release ABORT, but no replay attempt");
+    }
+
+    #[test]
+    fn block_write_timeout_still_retries_once() {
+        // docs/DESIGN-DECISIONS.md L9 keeps the single whole-transaction retry for block
+        // downloads (the ACK protocol cannot tell a lost ACK from a lost
+        // segment); only ≤`BLOCK_THRESHOLD` writes are exempt.
+        let payload = blob();
+        let mut bus = ScriptedBus::new(Faults {
+            swallow_requests: 1,
+            ..Faults::default()
+        });
+        let ex = Exchange::write(NODE, BLOB_ADDR, &payload).expect("node");
+        let progress = bus.drive_exchange(ex, short_deadline(50)).expect("retry");
+        assert!(matches!(progress, Progress::Done));
+        assert_eq!(bus.od.read(BLOB_ADDR).unwrap(), Value::Bytes(payload));
+        assert_eq!(bus.aborts_sent, 1, "exactly one ProtocolTimeout ABORT");
     }
 
     #[test]
@@ -806,15 +944,34 @@ mod tests {
             .drive_exchange(ex, short_deadline(20))
             .expect_err("peer stays silent");
         assert!(matches!(err, HostError::Timeout));
-        // BUGS.md #11: the peer must not be left with a dangling transaction
+        // docs/DESIGN-DECISIONS.md #11: the peer must not be left with a dangling transaction
         // when we give up — the final timeout also sends a ProtocolTimeout
         // ABORT (first timeout + final give-up = 2).
         assert_eq!(bus.aborts_sent, 2);
     }
 
     #[test]
+    fn io_error_during_retry_drain_propagates() {
+        // docs/DESIGN-DECISIONS.md N8: the retry's stale-response drain used `Err(_) =>
+        // break`, swallowing real IO errors (interface down etc.) and
+        // eventually reporting a misleading timeout. Like the
+        // transaction-start drain (八Q10) only a timeout may end the
+        // window; anything else surfaces.
+        let mut bus = ScriptedBus::new(Faults {
+            swallow_requests: 1,
+            io_errors: 1,
+            ..Faults::default()
+        });
+        let ex = Exchange::read(NODE, Address::new(0x1000, 0), DataType::Unsigned32).expect("node");
+        let err = bus
+            .drive_exchange(ex, short_deadline(50))
+            .expect_err("injected IO error must surface");
+        assert!(matches!(err, HostError::Io(_)), "got {err:?}");
+    }
+
+    #[test]
     fn stale_response_is_drained_before_new_transaction() {
-        // BUGS.md H1: 新事务起点（发出首帧前）必须排空本节点 cmd 套接字上的
+        // docs/DESIGN-DECISIONS.md H1: 新事务起点（发出首帧前）必须排空本节点 cmd 套接字上的
         // 陈旧响应，否则上一事务残留/迟到的响应会被当作新事务首帧喂入
         // `SdoClient::on_response`，造成状态错乱（UnexpectedFrame 等）。
         // 这里预置一条陈旧响应，验证它被事务起点排空、事务照常完成。

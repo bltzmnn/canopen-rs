@@ -92,7 +92,7 @@ enum Command {
         /// 可见字符串原样写入（非小端字节）；精确宽度请用 `--type`。
         ///
         /// `allow_hyphen_values`: `-2`/`-0x80` are data, not options
-        /// (BUGS.md 十M9).
+        /// (docs/DESIGN-DECISIONS.md 十M9).
         #[arg(allow_hyphen_values = true)]
         value: String,
         /// Subindex (dec or 0x-prefixed hex)
@@ -167,7 +167,7 @@ impl std::str::FromStr for IndexArg {
 }
 
 /// SDO node id argument: validated `1..=127` at the CLI boundary so node=0
-/// can never masquerade as a unicast SDO target (`BUGS.md` P2-2; NMT's
+/// can never masquerade as a unicast SDO target (`docs/DESIGN-DECISIONS.md` P2-2; NMT's
 /// `TargetArg` already enforced this).
 #[derive(Debug, Clone, Copy)]
 struct NodeArg(u8);
@@ -307,13 +307,19 @@ fn eds_command(cmd: EdsCommand) -> Result<()> {
     match cmd {
         EdsCommand::Dump { path } => {
             let eds = eds_io::load(&path)?;
+            // docs/DESIGN-DECISIONS.md EDS-01: every tolerant-parsing fallback is recorded in
+            // `eds.warnings` — python-canopen logs the same events via
+            // `logger.warning`, so the CLI must not swallow them.
+            for warning in &eds.warnings {
+                eprintln!("warning: {warning}");
+            }
             println!(
                 "{:<8} {:<28} {:<14} {:<6} PDO",
                 "INDEX", "NAME", "TYPE", "ACCESS"
             );
             for object in eds.objects.values() {
                 // CompactSubObj objects are shown expanded, exactly like
-                // `eds gen` builds them (`BUGS.md` 十M24: the raw sub-0
+                // `eds gen` builds them (`docs/DESIGN-DECISIONS.md` 十M24: the raw sub-0
                 // template used to be printed instead of subs 1..=N).
                 let expanded = canopen_host::eds::expand_compact_sub_obj(object);
                 let subs: Vec<(&u8, &canopen_host::eds::EdsSubEntry)> = match &expanded {
@@ -350,6 +356,9 @@ fn eds_command(cmd: EdsCommand) -> Result<()> {
             fn_name,
         } => {
             let eds = eds_io::load(&path)?;
+            for warning in &eds.warnings {
+                eprintln!("warning: {warning}");
+            }
             let source = canopen_host::codegen::generate_od_module(&eds, &fn_name)
                 .map_err(anyhow::Error::msg)?;
             match output {
@@ -378,7 +387,7 @@ mod bus {
             return Ok(());
         }
         // No --type: read raw bytes and decode by the response width
-        // (BUGS.md P3-20 — a fixed Unsigned32 guess aborted on narrower
+        // (docs/DESIGN-DECISIONS.md P3-20 — a fixed Unsigned32 guess aborted on narrower
         // objects).
         let bytes = bus.read_domain_bytes(node, Address::new(index, sub))?;
         let shown: Vec<String> = bytes.iter().map(|b| format!("{b:#04x}")).collect();
@@ -391,7 +400,7 @@ mod bus {
             }
             // 4/8-byte values are shown unsigned, consistent with the 1/2-byte
             // cases — a U32 with the high bit set must not print as a negative
-            // i32 (BUGS.md #20); the raw bytes stay visible for signed reads.
+            // i32 (docs/DESIGN-DECISIONS.md #20); the raw bytes stay visible for signed reads.
             4 => {
                 let v = u32::from_le_bytes(bytes.as_slice().try_into().expect("len checked"));
                 println!(
@@ -449,7 +458,7 @@ mod bus {
         let deadline = if duration == 0 {
             None
         } else {
-            // BUGS.md 十L12: `u64::MAX` seconds would overflow the platform
+            // docs/DESIGN-DECISIONS.md 十L12: `u64::MAX` seconds would overflow the platform
             // `Instant`; fail loudly instead of panicking.
             Some(
                 std::time::Instant::now()
@@ -478,19 +487,19 @@ mod bus {
                     // A heartbeat is exactly one byte (CANopenNode
                     // `CO_HBconsumer.c:43`); a longer `0x700+n` frame must
                     // not refresh the deadline and suppress Lost warnings
-                    // (`BUGS.md` 十M18).
+                    // (`docs/DESIGN-DECISIONS.md` 十M18).
                     (0x700..=0x77F).contains(&rx.cob_id) && rx.payload().len() == 1
                 })
             {
                 let node = rx.cob_id - 0x700;
                 // COB 0x700 decodes to node 0, which is outside the valid
                 // 1..=127 range — guard like `host/src/client.rs` instead of
-                // panicking on a stray frame (BUGS.md #13).
+                // panicking on a stray frame (docs/DESIGN-DECISIONS.md #13).
                 let Ok(node_id) = canopen_core::types::NodeId::try_from(node as u8) else {
                     continue;
                 };
                 // Supervise every producer we see: default deadline 1.5 s so
-                // `!! Lost` warnings can actually fire (BUGS.md P3-50).
+                // `!! Lost` warnings can actually fire (docs/DESIGN-DECISIONS.md P3-50).
                 hb.set_timeout(node_id, 1500);
                 for ev in hb.on_heartbeat(node_id, rx.payload(), canopen_host::transport::now_ms())
                 {
@@ -502,7 +511,7 @@ mod bus {
                     last_table = secs();
                     println!("  -- heartbeat table --");
                     for &n in &seen_nodes {
-                        // BUGS.md L8: `seen_nodes` only ever contains ids
+                        // docs/DESIGN-DECISIONS.md L8: `seen_nodes` only ever contains ids
                         // that passed `hb.on_heartbeat` earlier, but rely on
                         // the invariant explicitly instead of `.expect` so a
                         // future regression cannot turn into a panic.
@@ -552,14 +561,14 @@ mod bus {
     fn classify(cob_id: u16) -> (&'static str, &'static str) {
         // Predefined connection set: TPDO{n} lives in (0x180+n·0x100, …+0x80],
         // RPDO{n} in (0x200+n·0x100, …+0x80]. The previous single-range match
-        // swallowed the RPDO1..3 segments into "TPDO" (BUGS.md P3-3).
+        // swallowed the RPDO1..3 segments into "TPDO" (docs/DESIGN-DECISIONS.md P3-3).
         fn in_pdo_band(cob_id: u16, first: u16) -> Option<u8> {
             (0..4u16)
                 .find(|&i| {
                     let lo = first + i * 0x100;
                     // Upper bound excludes the next band's base COB-ID
                     // (node-id starts at 1, so `lo + 0x80` itself has no
-                    // owner — BUGS.md P3-3, see git history).
+                    // owner — docs/DESIGN-DECISIONS.md P3-3, see git history).
                     lo < cob_id && cob_id <= lo + 0x7F
                 })
                 .map(|i| i as u8 + 1)
@@ -601,7 +610,7 @@ mod bus {
                 DataType::OctetString | DataType::Domain | DataType::UnicodeString => {
                     // Variable-length payloads may exceed one CAN frame's 8
                     // bytes; the SDO layer picks the right transfer mode
-                    // (BUGS.md P3, --type str >8B).
+                    // (docs/DESIGN-DECISIONS.md P3, --type str >8B).
                     let bytes = canopen_host::eds::hex_bytes(raw);
                     if bytes.is_empty() && !raw.is_empty() {
                         Value::Str(raw.to_string())
@@ -612,9 +621,9 @@ mod bus {
                 other => {
                     // Detect the sign BEFORE stripping the radix prefix:
                     // "-0x8000" must parse as -32768, not fail (or worse,
-                    // lose the sign) — `BUGS.md` P2-2. Parsing goes through
+                    // lose the sign) — `docs/DESIGN-DECISIONS.md` P2-2. Parsing goes through
                     // i128 so Unsigned64 values up to 2^64-1 survive
-                    // (BUGS.md R10-P1-7); anything wider is a hard error.
+                    // (docs/DESIGN-DECISIONS.md R10-P1-7); anything wider is a hard error.
                     let trimmed = raw.trim();
                     let (negative, digits) = match trimmed.strip_prefix('-') {
                         Some(rest) => (true, rest.trim()),
@@ -632,14 +641,14 @@ mod bus {
                     let n = if negative { -magnitude } else { magnitude };
                     match other {
                         t if is_signed(t) => {
-                            // BUGS.md #34: a hex literal may be the
+                            // docs/DESIGN-DECISIONS.md #34: a hex literal may be the
                             // two's-complement spelling of a negative value
                             // (`--type i32 0x80000000` → -2147483648),
                             // matching the EDS `wrap_signed_hex` path.
                             // Decimal literals keep their plain sign.
                             let n = if radix == 16 {
                                 let bits = t.fixed_size().unwrap_or(8) * 8;
-                                // BUGS.md 十M10: reject a hex magnitude that
+                                // docs/DESIGN-DECISIONS.md 十M10: reject a hex magnitude that
                                 // does not fit the target width instead of
                                 // wrapping it silently (`--type i8 0x100` used
                                 // to write 0x00). python-canopen's
@@ -668,7 +677,7 @@ mod bus {
                         }
                         _ => {
                             // Negative values for unsigned types are a hard
-                            // error, never a silent clamp to 0 (`BUGS.md` P2-2).
+                            // error, never a silent clamp to 0 (`docs/DESIGN-DECISIONS.md` P2-2).
                             anyhow::ensure!(n >= 0, "negative value for {other:?}");
                             anyhow::ensure!(
                                 n <= u64::MAX as i128,
@@ -689,7 +698,7 @@ mod bus {
             let n = value.encode_as(dt, &mut buf)?;
             return Ok(buf[..n].to_vec());
         }
-        // Auto mode: honour 0x-prefixed / signed integers first (BUGS.md
+        // Auto mode: honour 0x-prefixed / signed integers first (docs/DESIGN-DECISIONS.md
         // P2-18 — previously "0xFF" was silently sent as 4 ASCII bytes),
         // falling back to ASCII text only when the token is not numeric.
         if let Some(n) = canopen_host::eds::parse_int(raw.trim()) {
@@ -700,16 +709,16 @@ mod bus {
         }
         // A token that *looks* numeric but exceeds i64 (e.g. a full
         // Unsigned64) must fail loudly instead of silently degrading to
-        // ASCII bytes (BUGS.md R10-P1-7).
+        // ASCII bytes (docs/DESIGN-DECISIONS.md R10-P1-7).
         let t = raw.trim();
-        // BUGS.md 八L11: strip the sign first — a negative literal beyond
+        // docs/DESIGN-DECISIONS.md 八L11: strip the sign first — a negative literal beyond
         // i64 (e.g. `-99999999999999999999999`) previously failed the
         // u128-only probe and silently degraded to ASCII bytes.
         let magnitude = t
             .strip_prefix('-')
             .or_else(|| t.strip_prefix('+'))
             .map_or(t, str::trim_start);
-        // BUGS.md 十M11: "looks numeric" must not depend on `u128` being
+        // docs/DESIGN-DECISIONS.md 十M11: "looks numeric" must not depend on `u128` being
         // able to hold the literal — a 44-digit decimal used to fall
         // through as ASCII. Digits-only after the optional radix prefix is
         // the robust criterion (and `i64::MIN` now parses via i128 below).
@@ -747,7 +756,7 @@ mod bus {
     mod tests {
         use super::*;
 
-        /// BUGS.md 十M24: positional subindex arguments accept `0x` hex, as
+        /// docs/DESIGN-DECISIONS.md 十M24: positional subindex arguments accept `0x` hex, as
         /// `docs/IMPLEMENTATION.md` promises for numeric arguments.
         #[test]
         fn sub_arg_accepts_hex_and_decimal() {
@@ -759,7 +768,7 @@ mod bus {
             assert!(SubArg::from_str("nope").is_err());
         }
 
-        /// BUGS.md R10-P3: `classify` had zero coverage while its PDO band
+        /// docs/DESIGN-DECISIONS.md R10-P3: `classify` had zero coverage while its PDO band
         /// boundaries were being reworked — pin the predefined connection set
         /// segmentation, including the exclusive upper bounds.
         #[test]
@@ -795,7 +804,7 @@ mod bus {
             }
         }
 
-        /// BUGS.md R10-P3 / R10-P1-7: `encode_value` must cover U64 full
+        /// docs/DESIGN-DECISIONS.md R10-P3 / R10-P1-7: `encode_value` must cover U64 full
         /// range under an explicit type, keep the auto mode's minimal-width
         /// integer encoding, and refuse out-of-i64 numerics instead of
         /// silently degrading them to ASCII.
@@ -823,7 +832,7 @@ mod bus {
                 encode_value("0xFFFFFFFFFFFFFFFF", None).is_err(),
                 "out-of-i64 numeric must not degrade to ASCII"
             );
-            // BUGS.md 八L11: negative overflow must also be loud — the old
+            // docs/DESIGN-DECISIONS.md 八L11: negative overflow must also be loud — the old
             // u128-only probe let `-999…` slip through as ASCII bytes.
             assert!(
                 encode_value("-99999999999999999999999", None).is_err(),
@@ -869,6 +878,30 @@ mod bus {
             assert_eq!(
                 encode_value("0x80", Some(Dt::Integer8)).unwrap(),
                 vec![0x80]
+            );
+        }
+
+        /// 负号在 radix 选择之前应用，显式有符号类型下的负十六进制字面量
+        /// 必须保留符号（四轮审计 N9 核验为误报，此前仅有正 hex 覆盖）。
+        #[test]
+        fn negative_hex_literal_keeps_its_sign() {
+            use canopen_core::datatypes::DataType as Dt;
+            assert_eq!(
+                encode_value("-0x1", Some(Dt::Integer16)).unwrap(),
+                vec![0xFF, 0xFF]
+            );
+            assert_eq!(
+                encode_value("-0x80", Some(Dt::Integer8)).unwrap(),
+                vec![0x80]
+            );
+            assert_eq!(
+                encode_value("-0x1", Some(Dt::Integer32)).unwrap(),
+                vec![0xFF; 4]
+            );
+            // Auto mode agrees with the explicit path.
+            assert_eq!(
+                encode_value("-0x1", None).unwrap(),
+                encode_value("-1", None).unwrap()
             );
         }
 

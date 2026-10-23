@@ -177,7 +177,7 @@ impl fmt::Display for DataType {
 /// Upper bound for variable-length values (VisibleString / OctetString /
 /// UnicodeString / Domain), matching docs/IMPLEMENTATION.md §3.2. Decoding
 /// and SDO segmented download enforce this so peers cannot grow buffers
-/// without bound (`BUGS.md` P2-15).
+/// without bound (`docs/DESIGN-DECISIONS.md` P2-15).
 pub const MAX_VALUE_LEN: usize = 65535;
 
 /// A typed value, as stored in an object dictionary entry or transferred
@@ -225,7 +225,7 @@ impl Value {
     /// type. Mostly identical to [`Value::encoded_len`], except when the
     /// target's wire representation is wider than the value's minimal one —
     /// currently only UNICODE_STRING, whose UTF-16LE encoding doubles (or
-    /// more) a Rust `Str` (`BUGS.md` L7).
+    /// more) a Rust `Str` (`docs/DESIGN-DECISIONS.md` L7).
     #[must_use]
     pub fn encoded_len_as(&self, dt: DataType) -> usize {
         if dt == DataType::UnicodeString {
@@ -309,7 +309,7 @@ impl Value {
                 _ => Err(type_mismatch(dt, self)),
             },
             Value::Uint(b @ (0 | 1)) if dt == DataType::Boolean => {
-                // python-canopen accepts integer 0/1 for BOOLEAN (BUGS.md
+                // python-canopen accepts integer 0/1 for BOOLEAN (docs/DESIGN-DECISIONS.md
                 // P3-36); keep the pyport surface equally lenient.
                 write_fixed(buf, &[*b as u8])
             }
@@ -364,7 +364,7 @@ impl Value {
             Value::Str(s) => match dt {
                 DataType::VisibleString => write_fixed(buf, s.as_bytes()),
                 // CiA 306 / python-canopen `encode_raw`: UNICODE_STRING is
-                // UTF-16LE on the wire (BUGS.md L7). Previously the Rust
+                // UTF-16LE on the wire (docs/DESIGN-DECISIONS.md L7). Previously the Rust
                 // string was written as UTF-8 bytes, which python-canopen
                 // decodes as UTF-16LE — corrupting every non-ASCII
                 // character exchanged with it. Callers must size `buf` with
@@ -417,7 +417,7 @@ impl Value {
             }
         } else if bytes.len() > MAX_VALUE_LEN {
             // Variable-length types are capped so a misbehaving peer cannot
-            // grow transfer buffers without bound (BUGS.md P2-15).
+            // grow transfer buffers without bound (docs/DESIGN-DECISIONS.md P2-15).
             return Err(Error::BadLength {
                 declared: MAX_VALUE_LEN,
                 actual: bytes.len(),
@@ -449,13 +449,30 @@ impl Value {
             )),
             // CiA 306 declares VisibleString ASCII; bytes above 0x7F are
             // replaced per Rust's from_utf8_lossy and do not survive a
-            // round trip — documented behaviour (`BUGS.md` R10-P2-13).
-            DataType::VisibleString => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
+            // round trip — documented behaviour (`docs/DESIGN-DECISIONS.md` R10-P2-13).
+            // C-based peers NUL-pad fixed-length strings; python strips the
+            // trailing NULs (`ascii` + `errors="ignore"` + `rstrip("\x00")`,
+            // `objectdictionary/__init__.py:448-450`), so do we (七E3).
+            DataType::VisibleString => Value::Str(
+                String::from_utf8_lossy(bytes)
+                    .trim_end_matches('\0')
+                    .to_string(),
+            ),
             DataType::OctetString
-            | DataType::UnicodeString
             | DataType::Domain
             | DataType::TimeOfDay
             | DataType::TimeDifference => Value::Bytes(bytes.to_vec()),
+            // UnicodeString stays a raw UTF-16LE byte blob in this stack
+            // (八M5); strip trailing NUL *code units* like python's
+            // `utf_16_le` decode + rstrip (`:451-454`), never a lone byte
+            // (which would leave an odd-length string). docs/DESIGN-DECISIONS.md 七E3.
+            DataType::UnicodeString => {
+                let mut end = bytes.len();
+                while end >= 2 && bytes[end - 2] == 0 && bytes[end - 1] == 0 {
+                    end -= 2;
+                }
+                Value::Bytes(bytes[..end].to_vec())
+            }
         })
     }
 }
@@ -515,7 +532,7 @@ const fn signed_width(v: i64) -> usize {
 
 /// Minimal byte width to represent `v` (no padding).
 const fn unsigned_width(v: u64) -> usize {
-    // Byte-exact boundaries: width n holds up to 2^(8n)-1 (BUGS.md C1).
+    // Byte-exact boundaries: width n holds up to 2^(8n)-1 (docs/DESIGN-DECISIONS.md C1).
     match v.leading_zeros() / 8 {
         8 | 7 => 1,
         6 => 2,
@@ -564,7 +581,7 @@ fn write_le_n(buf: &mut [u8], le_bytes: &[u8; 8], n: usize) -> Result<usize> {
 ///
 /// Values beyond the f32 range silently saturate to ±infinity and NaN is
 /// preserved — Rust's `as` semantics, matching CANopenNode's implicit
-/// conversion (`BUGS.md` P3-35).
+/// conversion (`docs/DESIGN-DECISIONS.md` P3-35).
 fn trunc_real32(r: f64) -> u32 {
     (r as f32).to_bits()
 }
@@ -597,7 +614,7 @@ mod tests {
 
     #[test]
     fn unsigned_width_boundaries_are_exact() {
-        // BUGS.md C1: each boundary must be the full-width max, not one
+        // docs/DESIGN-DECISIONS.md C1: each boundary must be the full-width max, not one
         // nibble short.
         assert_eq!(Value::Uint(0xFFFF_FFFF).encoded_len(), 4);
         assert_eq!(Value::Uint(0xFF_FFFF_FFFF).encoded_len(), 5);
@@ -610,7 +627,7 @@ mod tests {
 
     #[test]
     fn time_types_reject_non_six_byte_writes() {
-        // BUGS.md M8: TIME is a fixed 6-byte value; short/long byte strings
+        // docs/DESIGN-DECISIONS.md M8: TIME is a fixed 6-byte value; short/long byte strings
         // must not be accepted (they could not round-trip through decode_le).
         let mut buf = [0u8; 8];
         assert!(Value::Bytes(vec![1, 2, 3])
@@ -784,7 +801,7 @@ mod tests {
 
     #[test]
     fn unicode_string_encodes_utf16le_like_python_canopen() {
-        // BUGS.md L7: UNICODE_STRING is UTF-16LE on the wire (CiA 306,
+        // docs/DESIGN-DECISIONS.md L7: UNICODE_STRING is UTF-16LE on the wire (CiA 306,
         // python-canopen `encode_raw` → `utf_16_le`); a Rust `Str` must be
         // transcoded, not written as UTF-8 bytes (which python-canopen
         // would decode as UTF-16LE, corrupting non-ASCII characters).
@@ -819,6 +836,35 @@ mod tests {
                 declared: 4,
                 actual: 2
             })
+        );
+    }
+
+    /// docs/DESIGN-DECISIONS.md 七E3: python strips trailing NUL padding from C-style
+    /// fixed-length strings (`rstrip("\x00")`,
+    /// `objectdictionary/__init__.py:448-454`); the decoder must match.
+    #[test]
+    fn decoded_strings_strip_trailing_nul_padding() {
+        assert_eq!(
+            Value::decode_le(DataType::VisibleString, b"abc\0\0").unwrap(),
+            Value::Str("abc".to_string())
+        );
+        assert_eq!(
+            Value::decode_le(DataType::VisibleString, b"abc").unwrap(),
+            Value::Str("abc".to_string())
+        );
+        // UTF-16LE "ab" padded with two NUL *code units*.
+        assert_eq!(
+            Value::decode_le(
+                DataType::UnicodeString,
+                &[0x61, 0x00, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00]
+            )
+            .unwrap(),
+            Value::Bytes(vec![0x61, 0x00, 0x62, 0x00])
+        );
+        // Trailing OCTET bytes are data, never stripped.
+        assert_eq!(
+            Value::decode_le(DataType::OctetString, &[0x01, 0x00, 0x00]).unwrap(),
+            Value::Bytes(vec![0x01, 0x00, 0x00])
         );
     }
 

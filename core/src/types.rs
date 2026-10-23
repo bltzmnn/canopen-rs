@@ -32,7 +32,7 @@ pub enum Error {
         /// Address that was violated.
         addr: Address,
         /// `true` for a *read* of a write-only object, `false` for a *write*
-        /// to a read-only one (`BUGS.md` P3-34): lets direct OD users map to
+        /// to a read-only one (`docs/DESIGN-DECISIONS.md` P3-34): lets direct OD users map to
         /// the precise abort codes 0x0601_0001 / 0x0601_0002 instead of the
         /// generic local-control code.
         read: bool,
@@ -54,6 +54,20 @@ pub enum Error {
         declared: usize,
         /// Actual length in bytes.
         actual: usize,
+    },
+    /// A block download's final segment is entirely padding (`noData` covers
+    /// every byte received), i.e. the transfer ends with no data at all.
+    ///
+    /// CANopenNode rejects that shape with `CO_SDO_AB_DEVICE_INCOMPAT`
+    /// (0x0604_0047) before it ever compares the declared size
+    /// (`CO_SDOserver.c:908-916`); the padding count is never a valid
+    /// "declared length minus received" either.
+    #[error("block download end segment is all padding (noData {unused} of {received} bytes)")]
+    BlockEndAllPadding {
+        /// `noData` the end frame claimed.
+        unused: u8,
+        /// Bytes the block actually carried.
+        received: usize,
     },
     /// Destination buffer was too small for an encode operation.
     #[error("encode buffer too small: need {needed} bytes, have {available}")]
@@ -79,7 +93,7 @@ pub enum Error {
     ///
     /// Display fields are clamped to `i64` for message formatting only;
     /// range *decisions* use full-width arithmetic (u64 above `i64::MAX`
-    /// aborts correctly but displays saturated) (`BUGS.md` P3-37).
+    /// aborts correctly but displays saturated) (`docs/DESIGN-DECISIONS.md` P3-37).
     #[error("value {value} out of range [{min}, {max}]")]
     ValueOutOfRange {
         /// Offending value.
@@ -93,7 +107,7 @@ pub enum Error {
     /// COB-ID flags, reserved 0x1019 counter value 1, …). Mapped to
     /// `SdoAbortCode::InvalidValue` (0x0609_0030) like CANopenNode's
     /// `ODR_INVALID_VALUE`, instead of a range "too low/high" code
-    /// (`BUGS.md` 十L2).
+    /// (`docs/DESIGN-DECISIONS.md` 十L2).
     #[error("invalid value")]
     InvalidValue,
     /// A generic error with a message (last resort; prefer typed variants).
@@ -134,8 +148,16 @@ impl Error {
                     Some(SdoAbortCode::WriteOfReadOnlyObject)
                 }
             }
-            Error::TypeMismatch { .. } => Some(SdoAbortCode::TypeMismatchLengthLow),
-            // BUGS.md L2: an over-long payload is the *high* variant — the
+            // docs/DESIGN-DECISIONS.md SDO-02: a declared-type mismatch is the *generic*
+            // 0x0607_0010 (`SdoAbortCode::TypeMismatch`), not the "length too
+            // short" code — CANopenNode maps `ODR_TYPE_MISMATCH` to
+            // 0x06070010 (`CO_ODinterface.h:143`) and python-canopen aborts
+            // with `ABORT_LENGTH_NOT_MATCHED = 0x0607_0010` for every
+            // numeric-type mismatch (`sdo/constants.py:54`,
+            // `node/local.py:129-132`). The length codes stay reserved for
+            // real length violations ([`Error::BadLength`], `:145-151`).
+            Error::TypeMismatch { .. } => Some(SdoAbortCode::TypeMismatch),
+            // docs/DESIGN-DECISIONS.md L2: an over-long payload is the *high* variant — the
             // generic fallback previously always reported "too low".
             Error::BadLength { declared, actual } => Some(if actual > declared {
                 SdoAbortCode::TypeMismatchLengthHigh
@@ -143,10 +165,14 @@ impl Error {
                 SdoAbortCode::TypeMismatchLengthLow
             }),
             Error::ToggleBit => Some(SdoAbortCode::ToggleNotAlternated),
-            // BUGS.md 八L7: invalid block size has its own CiA 301 code
+            // docs/DESIGN-DECISIONS.md SDO-36: an end segment that is *entirely* padding maps
+            // to the reference's `CO_SDO_AB_DEVICE_INCOMPAT` (0x0604_0047),
+            // not to one of the 0x0607_00xx length codes.
+            Error::BlockEndAllPadding { .. } => Some(SdoAbortCode::GeneralInternalIncompatibility),
+            // docs/DESIGN-DECISIONS.md SDO-38: invalid block size has its own CiA 301 code
             // (0x0504_0002) instead of a generic error.
             Error::InvalidBlockSize => Some(SdoAbortCode::InvalidBlockSize),
-            // BUGS.md M1: block-transfer CRC failure must surface as the
+            // docs/DESIGN-DECISIONS.md M1: block-transfer CRC failure must surface as the
             // specific 0x0504_0004 code, not a generic error.
             Error::CrcMismatch => Some(SdoAbortCode::CrcError),
             Error::UnexpectedFrame | Error::BufferTooSmall { .. } => None,
@@ -259,7 +285,7 @@ mod tests {
 
     #[test]
     fn value_out_of_range_picks_low_or_high_abort() {
-        // BUGS.md m11: below the range → ValueTooLow, above → ValueTooHigh.
+        // docs/DESIGN-DECISIONS.md m11: below the range → ValueTooLow, above → ValueTooHigh.
         let err = Error::ValueOutOfRange {
             value: -5,
             min: 0,
@@ -283,7 +309,28 @@ mod tests {
     #[test]
     fn bad_length_and_crc_map_to_specific_aborts() {
         use crate::sdo::SdoAbortCode;
-        // BUGS.md L2: over-long payload → LengthHigh, short → LengthLow.
+        // docs/DESIGN-DECISIONS.md SDO-02: a declared-type mismatch is the generic 0x0607_0010,
+        // not the "length too short" variant.
+        assert_eq!(
+            Error::TypeMismatch {
+                addr: Address::new(0x2000, 0),
+                expected: crate::datatypes::DataType::Unsigned32,
+                actual: crate::datatypes::DataType::VisibleString,
+            }
+            .abort_code(),
+            Some(SdoAbortCode::TypeMismatch)
+        );
+        assert_eq!(
+            SdoAbortCode::from_u32(0x0607_0010),
+            SdoAbortCode::TypeMismatch,
+            "the generic type-mismatch abort must stay 0x0607_0010"
+        );
+        assert_ne!(
+            SdoAbortCode::TypeMismatch,
+            SdoAbortCode::TypeMismatchLengthLow,
+            "0x0607_0010 must not collapse into the length-low code"
+        );
+        // docs/DESIGN-DECISIONS.md L2: over-long payload → LengthHigh, short → LengthLow.
         let over = Error::BadLength {
             declared: 2,
             actual: 4,
@@ -300,7 +347,7 @@ mod tests {
             short.abort_code(),
             Some(SdoAbortCode::TypeMismatchLengthLow)
         );
-        // BUGS.md M1: CRC mismatch → the dedicated 0x0504_0004 code, not a
+        // docs/DESIGN-DECISIONS.md M1: CRC mismatch → the dedicated 0x0504_0004 code, not a
         // generic error.
         assert_eq!(
             Error::CrcMismatch.abort_code(),

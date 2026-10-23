@@ -58,7 +58,7 @@ impl AccessType {
 /// Implementations must **not panic**: a panic inside `read`/`write`
 /// propagates through [`ObjectDictionary::read`] / [`ObjectDictionary::write`]
 /// into the caller's `Node::poll` / `Node::on_frame` stack (unlike EMCY
-/// consumer callbacks, which are isolated) (`BUGS.md` P3-43).
+/// consumer callbacks, which are isolated) (`docs/DESIGN-DECISIONS.md` P3-43).
 pub trait ObjectAccess: Send + Sync {
     /// Reads the current value for the addressed subentry.
     ///
@@ -166,7 +166,7 @@ impl Entry {
 pub struct ObjectDictionary {
     entries: BTreeMap<Address, Entry>,
     /// Addresses successfully written since the last [`Self::take_dirty`]
-    /// drain (`BUGS.md` P3-11): the flagsPDO trigger source for
+    /// drain (`docs/DESIGN-DECISIONS.md` P3-11): the flagsPDO trigger source for
     /// event-driven TPDOs.
     dirty: std::collections::BTreeSet<Address>,
 }
@@ -216,9 +216,22 @@ impl ObjectDictionary {
     /// declared type and range, mirroring CANopenNode's direct OD access for
     /// internal state (docs/REFERENCES.md S7).
     ///
+    /// This is the historical name and is kept for compatibility; new code
+    /// should use [`Self::set_value_unchecked`] to make the bypass explicit.
+    ///
     /// # Errors
     /// Same as [`ObjectDictionary::write`] minus the access check.
     pub fn set_value(&mut self, addr: Address, value: Value) -> Result<()> {
+        self.set_value_unchecked(addr, value)
+    }
+
+    /// Explicitly named form of [`Self::set_value`]: writes a value while
+    /// bypassing the entry's [`AccessType`] check, but still validating its
+    /// declared type and range.
+    ///
+    /// # Errors
+    /// Same as [`ObjectDictionary::write`] minus the access check.
+    pub fn set_value_unchecked(&mut self, addr: Address, value: Value) -> Result<()> {
         let entry = self
             .entries
             .get_mut(&addr)
@@ -300,7 +313,7 @@ impl ObjectDictionary {
         }
         // Type/range check against the declared type — shared with
         // `set_value` via `check_encode` (single source of truth,
-        // `BUGS.md` R10-P3).
+        // `docs/DESIGN-DECISIONS.md` R10-P3).
         Self::check_encode(entry.data_type, addr, &value)?;
         let outcome = match &mut entry.storage {
             Storage::Value(slot) => {
@@ -318,12 +331,12 @@ impl ObjectDictionary {
     /// Type/width validation shared by [`Self::set_value`] and
     /// [`Self::write`]: fixed-size types must fit a CAN-frame-width scratch
     /// buffer and re-encode exactly; variable-length kinds are checked by
-    /// encoding into a throwaway buffer (`BUGS.md` P3-48).
+    /// encoding into a throwaway buffer (`docs/DESIGN-DECISIONS.md` P3-48).
     fn check_encode(dt: DataType, addr: Address, value: &Value) -> Result<()> {
         if let Some(size) = dt.fixed_size() {
             // Fixed-size types are at most 8 bytes (the CAN-frame width), so
             // `size > 8` can never happen — the branch was dead code
-            // (`BUGS.md` L2); keep the invariant as a debug assertion.
+            // (`docs/DESIGN-DECISIONS.md` L2); keep the invariant as a debug assertion.
             let mut buf = [0u8; 8];
             debug_assert!(size <= buf.len(), "fixed_size() exceeds 8 bytes");
             value
@@ -333,10 +346,10 @@ impl ObjectDictionary {
             // Variable-length: only check kind compatibility by encoding
             // into a throwaway buffer sized to the value. The absolute
             // value cap mirrors the SDO side so an over-long value can
-            // never be stored yet unreadable on the wire (BUGS.md #31).
+            // never be stored yet unreadable on the wire (docs/DESIGN-DECISIONS.md #31).
             // `encoded_len_as` covers target types whose wire form is wider
             // than the value's minimal one (UNICODE_STRING UTF-16LE,
-            // BUGS.md L7).
+            // docs/DESIGN-DECISIONS.md L7).
             let n = value.encoded_len_as(dt);
             if n > crate::datatypes::MAX_VALUE_LEN {
                 return Err(Error::BadLength {
@@ -350,7 +363,7 @@ impl ObjectDictionary {
         Ok(())
     }
 
-    /// Drains the set of addresses written since the last call (BUGS.md
+    /// Drains the set of addresses written since the last call (docs/DESIGN-DECISIONS.md
     /// P3-11): consumed by `Node::poll` to fire event-driven TPDOs whose
     /// mappings were touched (flagsPDO semantics).
     pub fn take_dirty(&mut self) -> std::collections::BTreeSet<Address> {
@@ -372,6 +385,27 @@ mod tests {
                 subindex: 0
             })
         );
+    }
+
+    #[test]
+    fn set_value_unchecked_bypasses_access_but_not_type() {
+        let mut od = ObjectDictionary::new();
+        od.insert(
+            Address::new(0x2000, 0),
+            Entry::new(
+                "ro",
+                DataType::Unsigned8,
+                AccessType::Ro,
+                Storage::Value(Value::Uint(1)),
+            ),
+        );
+        od.set_value_unchecked(Address::new(0x2000, 0), Value::Uint(9))
+            .unwrap();
+        assert_eq!(od.read(Address::new(0x2000, 0)).unwrap(), Value::Uint(9));
+        assert!(matches!(
+            od.set_value_unchecked(Address::new(0x2000, 0), Value::Uint(300)),
+            Err(Error::ValueOutOfRange { .. })
+        ));
     }
 
     #[test]

@@ -112,7 +112,7 @@ pub fn encode_command(command: NmtCommand, target: Option<NodeId>) -> [u8; 2] {
 #[must_use]
 pub fn decode_command(data: &[u8]) -> Option<(NmtCommand, u8)> {
     // CiA 301: the NMT command frame is exactly 2 bytes; CANopenNode
-    // (`CO_NMT_Heartbeat.c:38`) ignores any other DLC (BUGS.md 八L12).
+    // (`CO_NMT_Heartbeat.c:38`) ignores any other DLC (docs/DESIGN-DECISIONS.md 八L12).
     if data.len() != 2 {
         return None;
     }
@@ -196,10 +196,10 @@ impl NmtStateMachine {
     ///
     /// Transition rules (CiA 301):
     /// - resets return to Initialising from any state;
-    /// - operational commands are ignored while initialising;
+    /// - `StartRemoteNode` is also honoured while Initialising;
     /// - re-entering the current state is a no-op.
     ///
-    /// # Reset trap (adjudicated, `BUGS.md` H2)
+    /// # Reset trap (adjudicated, `docs/DESIGN-DECISIONS.md` H2)
     ///
     /// A reset leaves the machine in `Initialising`; the caller must follow
     /// up with [`Self::boot`] so the node re-enters PreOperational and
@@ -215,7 +215,15 @@ impl NmtStateMachine {
                 changed
             }
             NmtCommand::StartRemoteNode => {
-                if self.state == NmtState::PreOperational || self.state == NmtState::Stopped {
+                // docs/DESIGN-DECISIONS.md NMT-14: CiA 301 requires a node to accept NMT
+                // commands while Initialising, and both references apply
+                // `CO_NMT_ENTER_OPERATIONAL` unconditionally
+                // (`CO_NMT_Heartbeat.c:207-220` has no state gate,
+                // python `nmt.py:57-66` assigns `self._state` outright). The
+                // old gate silently dropped a master command that raced
+                // application start-up (the reachable window is
+                // `Node::new` → the application's first `boot()`).
+                if !matches!(self.state, NmtState::Operational) {
                     self.state = NmtState::Operational;
                     true
                 } else {
@@ -288,6 +296,9 @@ struct MonitoredEntry {
     phase: Phase,
     state: Option<NmtState>,
     last_seen_ms: u64,
+    /// 0-based 0x1016 array position when this entry came from the object
+    /// dictionary, used for the 0x8130 infoCode.
+    sub_index: Option<u16>,
 }
 
 /// Consumer-side heartbeat monitoring: per-node timeout supervision with a
@@ -305,7 +316,7 @@ pub struct HeartbeatConsumer {
     monitored: BTreeMap<u8, MonitoredEntry>,
     /// Supervision tolerance in percent (§6.5): the effective deadline is
     /// `timeout_ms × (1 + tolerance_pct / 100)`. Zero (default) means
-    /// strict deadlines (`BUGS.md` P3-14).
+    /// strict deadlines (`docs/DESIGN-DECISIONS.md` P3-14).
     tolerance_pct: u32,
 }
 
@@ -329,21 +340,43 @@ impl HeartbeatConsumer {
     }
 
     /// Effective supervision deadline for a configured timeout, including
-    /// the tolerance margin (`BUGS.md` P3-14).
+    /// the tolerance margin (`docs/DESIGN-DECISIONS.md` P3-14).
     #[must_use]
     pub fn deadline_ms(timeout_ms: u32, tolerance_pct: u32) -> u64 {
         u64::from(timeout_ms) + (u64::from(timeout_ms) * u64::from(tolerance_pct)) / 100
+    }
+
+    /// Clears the supervision state of every monitored node back to
+    /// `Unknown` without dropping the configuration (timeout values survive).
+    ///
+    /// Mirrors CANopenNode's `(pre)operational state changed` branch
+    /// (`CO_HBconsumer.c:404-417`): on any edge into or out of
+    /// PreOperational/Operational every entry's NMT state becomes unknown
+    /// and its heartbeat state returns to `UNKNOWN`, so the next heartbeat
+    /// re-announces `Started` and stale `last_seen` stamps cannot fire an
+    /// immediate false `Lost` after a long Stopped period (`docs/DESIGN-DECISIONS.md` 七F3).
+    pub fn reset_states(&mut self) {
+        for entry in self.monitored.values_mut() {
+            entry.phase = Phase::Unknown;
+            entry.state = None;
+            entry.last_seen_ms = 0;
+        }
     }
 
     /// Starts monitoring `node` with a timeout in ms (reconfiguration is
     /// allowed at runtime, mirroring writes to 0x1016). A `timeout_ms` of
     /// zero disables supervision of that node (CANopenNode semantics for
     /// `time_us == 0`) and drops the entry entirely, so `configured()` and
-    /// the aggregate predicates stop reporting it (`BUGS.md` 十M5).
+    /// the aggregate predicates stop reporting it (`docs/DESIGN-DECISIONS.md` 十M5).
     ///
-    /// Reconfiguration with a non-zero timeout keeps the current phase and
-    /// last-seen stamp — only the deadline changes (`BUGS.md` R10-P3,
-    /// documented).
+    /// Reconfiguration with a **different** non-zero timeout **resets the
+    /// supervision state** of the entry (`phase`/`state`/`last_seen` back to
+    /// unknown), not just the deadline: CANopenNode's `OD_write_1016` calls
+    /// `CO_HBconsumer_initEntry` on every write, which sets
+    /// `NMTstate = CO_NMT_UNKNOWN`, clears `CANrxNew` and puts
+    /// `HBstate = CO_HBconsumer_UNKNOWN` (`CO_HBconsumer.c:76-101,168-216`).
+    /// Keeping the pre-write silence made a reconfiguration able to fire a
+    /// false `Lost` (plus 0x8130) on the very next poll — docs/DESIGN-DECISIONS.md NMT-13.
     pub fn set_timeout(&mut self, node: NodeId, timeout_ms: u32) {
         if timeout_ms == 0 {
             self.monitored.remove(&node.get());
@@ -354,8 +387,31 @@ impl HeartbeatConsumer {
             phase: Phase::Unknown,
             state: None,
             last_seen_ms: 0,
+            sub_index: None,
         });
-        entry.timeout_ms = timeout_ms;
+        // docs/DESIGN-DECISIONS.md NMT-15: the reference re-inits **the written entry only**
+        // (`CO_HBconsumer_initEntry(stream->subIndex - 1U)`,
+        // `CO_HBconsumer.c:93-94`). `Node::resync_hb_consumers_from_od`
+        // re-applies every 0x1016 sub on any write, so resetting
+        // unconditionally would throw away the supervision state of unrelated
+        // entries (they go back to `Unknown` and cannot report `Lost` until
+        // their next heartbeat, and a latched 0x8130 can no longer be cleared
+        // by a recovering node alone). Reset only on an actual change.
+        if entry.timeout_ms != timeout_ms {
+            entry.timeout_ms = timeout_ms;
+            entry.phase = Phase::Unknown;
+            entry.state = None;
+            entry.last_seen_ms = 0;
+        }
+    }
+
+    /// Starts monitoring `node` and records its 0-based 0x1016 array
+    /// position for the 0x8130 infoCode.
+    pub(crate) fn set_timeout_with_index(&mut self, node: NodeId, timeout_ms: u32, sub_index: u16) {
+        self.set_timeout(node, timeout_ms);
+        if let Some(entry) = self.monitored.get_mut(&node.get()) {
+            entry.sub_index = Some(sub_index);
+        }
     }
 
     /// Stops monitoring a node.
@@ -375,19 +431,28 @@ impl HeartbeatConsumer {
     ///
     /// Frames from unconfigured nodes are ignored.
     ///
-    /// Adjudicated limitation (`BUGS.md` H2): an undecodable state byte is
-    /// silently dropped — no error is reported and no timeout is started.
-    /// Acceptable from the consumer's point of view (a malformed frame is
-    /// not evidence the producer died), but the frame is consumed without a
-    /// trace.
+    /// An undecodable state byte is silently dropped as a *state* — no
+    /// `Started`/`StateChanged` event — but it still refreshes the
+    /// supervision deadline: CANopenNode resets `timeoutTimer` for any
+    /// DLC==1 heartbeat because it casts the raw byte without validation
+    /// (`CO_HBconsumer.c:43-46,335,346`). Without the refresh a node
+    /// emitting malformed heartbeats was judged `Lost` (docs/DESIGN-DECISIONS.md NMT-N1).
     pub fn on_heartbeat(&mut self, node: NodeId, data: &[u8], now_ms: u64) -> Vec<HbEvent> {
+        // docs/DESIGN-DECISIONS.md NMT-04: only DLC==1 frames are heartbeats. The reference's
+        // receive filter drops everything else (`CO_HBconsumer.c:43`: `if
+        // (DLC == 1U)`), and `Node::on_frame` applies that gate — but this
+        // public API was reachable directly with a longer slice, which was
+        // then treated as a perfectly good heartbeat.
+        if data.len() != 1 {
+            return Vec::new();
+        }
         let Some(entry) = self.monitored.get_mut(&node.get()) else {
             return Vec::new();
         };
+        entry.last_seen_ms = now_ms;
         let Some((state, _toggle)) = decode_heartbeat(data) else {
             return Vec::new();
         };
-        entry.last_seen_ms = now_ms;
 
         let mut events = Vec::new();
         if state == NmtState::Initialising {
@@ -397,7 +462,7 @@ impl HeartbeatConsumer {
             // entry — UNKNOWN (never seen since configuration) included; only
             // the accompanying EMCY report is gated on `HBstate == ACTIVE`.
             // Entries only exist for monitored nodes, so an event always
-            // fires here (BUGS.md B2).
+            // fires here (docs/DESIGN-DECISIONS.md B2).
             events.push(HbEvent::RemoteReset { node });
             entry.phase = Phase::Unknown;
             entry.state = None;
@@ -450,10 +515,25 @@ impl HeartbeatConsumer {
         self.monitored.get(&node.get())?.state
     }
 
+    /// 0-based 0x1016 array index of a monitored entry, when known. This is
+    /// the counterpart of CANopenNode's loop counter `i` and the value used
+    /// as the 0x8130 infoCode (`CO_HBconsumer.c:364`). Programmatic users
+    /// that did not come through 0x1016 fall back to node-id ordering.
+    #[must_use]
+    pub fn entry_index(&self, node: NodeId) -> Option<u16> {
+        let entry = self.monitored.get(&node.get())?;
+        entry.sub_index.or_else(|| {
+            self.monitored
+                .keys()
+                .position(|id| *id == node.get())
+                .and_then(|i| u16::try_from(i).ok())
+        })
+    }
+
     /// Whether `node` is under active supervision (a non-zero timeout is
     /// configured). Only supervised nodes' `0x700+n` frames belong to the
     /// consumer — anything else in that COB-ID range must stay available
-    /// for custom RPDO/SYNC configurations (`BUGS.md` P3, mirroring
+    /// for custom RPDO/SYNC configurations (`docs/DESIGN-DECISIONS.md` P3, mirroring
     /// python-canopen's per-node subscription and CANopenNode's
     /// per-entry rx filter in `CO_HBconsumer.c`).
     #[must_use]
@@ -477,6 +557,17 @@ impl HeartbeatConsumer {
     #[must_use]
     pub fn all_active(&self) -> bool {
         !self.monitored.is_empty() && self.monitored.values().all(|e| e.phase == Phase::Active)
+    }
+
+    /// Whether no node is monitored at all (0x1016 has no active entries).
+    ///
+    /// Distinct from the negation of [`Self::all_active`] (which is also
+    /// false while configured nodes have never been seen): clearing a
+    /// consumer-bus EMCY condition treats an empty monitoring set as
+    /// "nothing outstanding" (`docs/DESIGN-DECISIONS.md` 审-N1).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.monitored.is_empty()
     }
 
     /// Whether at least one node is monitored and every monitored node is
@@ -510,7 +601,7 @@ mod tests {
         );
         assert!(decode_command(&[0x99]).is_none());
         assert!(decode_command(&[0xAB, 0x05]).is_none()); // unknown command
-                                                          // BUGS.md m13: targets above the CiA node-id range are invalid.
+                                                          // docs/DESIGN-DECISIONS.md m13: targets above the CiA node-id range are invalid.
         assert!(decode_command(&[0x01, 0x80]).is_none());
         assert!(decode_command(&[0x01, 0xFF]).is_none());
     }
@@ -520,11 +611,19 @@ mod tests {
         let mut nmt = NmtStateMachine::new();
         assert_eq!(nmt.state(), NmtState::Initialising);
 
-        // Operational commands are ignored while initialising...
-        nmt.apply(NmtCommand::StartRemoteNode);
-        assert_eq!(nmt.state(), NmtState::Initialising);
+        // docs/DESIGN-DECISIONS.md NMT-14: unlike Stop/EnterPreOperational (which have no
+        // meaning during Initialising), a Start is honoured right away — CiA
+        // 301 wants a command that races application start-up to be applied,
+        // and both references do so unconditionally
+        // (`CO_NMT_Heartbeat.c:207-220`、python `nmt.py:57-66`).
+        assert!(nmt.apply(NmtCommand::StartRemoteNode));
+        assert_eq!(nmt.state(), NmtState::Operational);
 
-        // ...only boot() leaves Initialising (and reports boot-up needed).
+        // boot() from Operational is a no-op (the node is already started).
+        assert!(!nmt.boot());
+        assert_eq!(nmt.state(), NmtState::Operational);
+        nmt.apply(NmtCommand::ResetCommunication);
+        assert_eq!(nmt.state(), NmtState::Initialising);
         assert!(nmt.boot());
         assert_eq!(nmt.state(), NmtState::PreOperational);
         assert!(!nmt.boot()); // second boot is a no-op
@@ -605,6 +704,33 @@ mod tests {
     }
 
     #[test]
+    fn malformed_heartbeat_refreshes_the_deadline_without_events() {
+        // docs/DESIGN-DECISIONS.md NMT-N1: CANopenNode resets the timeout timer for *any*
+        // DLC==1 heartbeat because it casts the raw byte without validation
+        // (`CO_HBconsumer.c:43-46,335,346`); only the state update is
+        // skipped for undecodable bytes.
+        let (mut c, n) = consumer_with_node(100);
+        let _ = c.on_heartbeat(n, &[0x05], 10);
+        assert!(c.is_active(n));
+
+        // 0x42 is not a valid state: no event, but the beat counts as life.
+        assert!(c.on_heartbeat(n, &[0x42], 50).is_empty());
+        assert!(c.poll(100).is_empty(), "deadline refreshed at t=50");
+        assert!(c.is_active(n));
+
+        // Silence from the last (malformed) beat does time out on schedule.
+        assert_eq!(c.poll(160), vec![HbEvent::Lost { node: n }]);
+
+        // A node that only ever sent malformed bytes is never ACTIVE and
+        // therefore never times out (no Started either) — the remaining
+        // intentional narrowing vs CANopenNode, cf. docs/DESIGN-DECISIONS.md adjudications.
+        let (mut c, n) = consumer_with_node(100);
+        assert!(c.on_heartbeat(n, &[0x42], 10).is_empty());
+        assert!(!c.is_active(n));
+        assert!(c.poll(200).is_empty());
+    }
+
+    #[test]
     fn consumer_detects_remote_reset() {
         let (mut c, n) = consumer_with_node(500);
         c.on_heartbeat(n, &[0x05], 10);
@@ -643,7 +769,7 @@ mod tests {
 
     #[test]
     fn set_timeout_zero_fully_disables_supervision() {
-        // BUGS.md 十M5: the documented "0 disables supervision" must remove
+        // docs/DESIGN-DECISIONS.md 十M5: the documented "0 disables supervision" must remove
         // the entry, not leave a zombie that `configured()`/`all_active()`
         // keep reporting.
         let mut c = HeartbeatConsumer::new();
@@ -659,6 +785,17 @@ mod tests {
         assert!(!c.all_active());
         assert_eq!(c.state_of(n), None);
         assert!(c.poll(10_000).is_empty());
+    }
+
+    #[test]
+    fn entry_index_follows_0x1016_subindex_not_node_order() {
+        let mut c = HeartbeatConsumer::new();
+        let nine = NodeId::new(9).unwrap();
+        let seven = NodeId::new(7).unwrap();
+        c.set_timeout_with_index(nine, 100, 0);
+        c.set_timeout_with_index(seven, 100, 1);
+        assert_eq!(c.entry_index(nine), Some(0));
+        assert_eq!(c.entry_index(seven), Some(1));
     }
 
     #[test]

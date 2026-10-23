@@ -1,10 +1,10 @@
 # 交叉验证测试计划（Cross-Validation Test Plan）
 
-> **实现状态**（2026-09-14）：本计划为**待实施路线图**。下方引用的
-> `host/tests/xcan_s1_canopenlinux_slave.rs`、`tools/interop/python_slave_node.py`、
-> `tools/interop/s4_python_master.py`、`host/examples/served_node` 等测试资产
-> **尚未实现**；当前已交付的总线级验证仅 `host/tests/vcan.rs` 的自回环测试。
-> `docs/IMPLEMENTATION.md` §14 已同步标注。
+> **实现状态**（2026-10-23）：本计划已在两块 T536 开发板上完成四向实测
+> （Rust ↔ CANopenLinux C、Rust ↔ python-canopen），结果与抓包证据见
+> **`tests/interop/RESULTS-2026-10-23.md`**。测试 harness、C 副本和日志位于
+> 仓外 `/tmp/canopen-interop`；下方引用的 in-repo 路径仍未落地，不能仅依赖
+> 本计划当作可重复脚本。`host/tests/vcan.rs` 继续作为无硬件的 vcan 预检。
 
 本测试计划将 canopen-rs 与两个独立参考实现进行**四向交叉验证**：
 
@@ -150,7 +150,7 @@ python 脚本以 **`ref/canopen/test/sample.eds`** 为从站 OD（含 0x1008 设
 | S3-03 | 分段写 vs | `[3] 5 write 0x2100 0 vs <200字符>` | 回读一致 |
 | S3-04 | block download | `set sdo_block 1` 后向 0x2101 写 900B | 我方 server CRC 校验接收；`read` 回读一致 |
 | S3-05 | NMT 序列 | `start node 5` / `stop node 5` / `reset node 5` | 我方心跳字节 05→04→boot-up 重发 |
-| S3-06 | Abort 透传 | `read 0x5555 0` | `ERROR:0x6020000` 格式响应 |
+| S3-06 | Abort 透传 | `read 0x5555 0` | `ERROR:0x06020000` 格式响应（大写、8 位补零，docs/DESIGN-DECISIONS.md G8） |
 | S3-07 | 心跳消费（主站侧） | 先 `[n] 10 write 0x1016 1 u32 0x000C03E8`（监视 12 号…改为监视 5 号：`0x000503E8`=node5/1000ms）→ kill served_node | canopend 报 HB consumer error（EMCY 或日志） |
 | S3-08 | LSS 交叉验证 | `lss_switch_glob`/`lss_set_node`/fastscan 族 | **二期项**：依赖 cocomm LSS 行为调研（见 §9） |
 

@@ -46,11 +46,15 @@ fn file_roundtrip_and_reset() {
 
     backend.save(&od).unwrap();
     let raw = std::fs::read_to_string(&path).unwrap();
-    assert!(raw.contains("# canopen-rs parameter storage v1"));
-    assert!(
-        raw.contains("6000 001 02 ef be"),
-        "unexpected content:\n{raw}"
+    assert!(raw.contains("# canopen-rs parameter storage v2"));
+    // G7: the v2 line carries a CRC16 over its canonical fields
+    // (`canopen_core::sdo::block::crc16`, the same XMODEM variant
+    // CANopenNode uses in `CO_storageLinux.c`).
+    let expected = format!(
+        "6000 001 02 ef be {:04x}",
+        canopen_core::sdo::block::crc16(b"6000 001 02 ef be")
     );
+    assert!(raw.contains(&expected), "unexpected content:\n{raw}");
     assert!(!raw.contains("6000 002"));
 
     // Mutate, then load restores the saved value.
@@ -85,7 +89,7 @@ fn missing_file_loads_as_noop() {
             .join("deeper"),
     );
     // Distinct per-process path keeps parallel CI runs from racing on a fixed
-    // /tmp name (BUGS.md R10-P3).
+    // /tmp name (docs/DESIGN-DECISIONS.md R10-P3).
     let mut od = test_od();
     backend.load(&mut od).unwrap(); // no error
     assert_eq!(od.read(Address::new(0x6000, 1)).unwrap(), Value::Uint(111));
@@ -93,7 +97,7 @@ fn missing_file_loads_as_noop() {
 
 #[test]
 fn save_is_atomic_via_temp_file() {
-    // BUGS.md m8: a crash mid-save must never leave a truncated parameter
+    // docs/DESIGN-DECISIONS.md m8: a crash mid-save must never leave a truncated parameter
     // file — the payload lands in a sibling .tmp first, then renames over
     // the target (CANopenNode CO_storageLinux.c).
     let dir = std::env::temp_dir().join("canopen-rs-atomic-test");
@@ -116,7 +120,7 @@ fn save_is_atomic_via_temp_file() {
     reloaded.load(&mut od2).unwrap();
 }
 
-/// `BUGS.md` P2-1: declared-width encoding — zero and negative values of
+/// `docs/DESIGN-DECISIONS.md` P2-1: declared-width encoding — zero and negative values of
 /// fixed-width types must survive save → load (previously saved at minimal
 /// width and silently skipped on load).
 #[test]
@@ -171,10 +175,10 @@ fn small_and_negative_fixed_width_values_round_trip() {
     assert_eq!(od.read(Address::new(0x4003, 0)).unwrap(), Value::Uint(7));
 }
 
-/// BUGS.md H2: a line carrying MORE hex tokens than its declared `len` is
-/// corrupt — the old `parts.take(len)` silently dropped the excess, so a
+/// docs/DESIGN-DECISIONS.md H2 + G7: a line carrying MORE hex tokens than its declared `len`
+/// is corrupt — the old `parts.take(len)` silently dropped the excess, so a
 /// damaged row whose first `len` bytes happened to be valid loaded as a
-/// clean entry. It must now be skipped like any other bad line.
+/// clean entry. It is skipped *and* the corruption is reported now.
 #[test]
 fn line_with_extra_tokens_is_rejected() {
     use canopen_core::object_dictionary::ObjectDictionary;
@@ -200,16 +204,65 @@ fn line_with_extra_tokens_is_rejected() {
     entry.persistent = true;
     od.insert(Address::new(0x6000, 1), entry);
     let backend = FileStorage::new(path.clone());
-    backend.load(&mut od).unwrap();
+    let err = backend
+        .load(&mut od)
+        .expect_err("a corrupt line must be reported");
+    assert!(
+        err.to_string().contains("corrupt"),
+        "error must name the corruption: {err}"
+    );
 
     // Default (111) untouched — the corrupt line was skipped.
     assert_eq!(od.read(Address::new(0x6000, 1)).unwrap(), Value::Uint(111));
     let _ = std::fs::remove_file(&path);
 }
 
-/// BUGS.md M7：损坏/恶意的存储文件传入超大 `len`（如 `4294967295`）曾触发
-/// 无上限 `with_capacity(len)` 分配（DoS/OOM）。修复后超限行按坏行跳过，
-/// 既不预分配也不解析其数据字节，加载不恐慌、值保持默认。
+/// docs/DESIGN-DECISIONS.md M7 + G7：损坏/恶意的存储文件传入超大 `len`（如
+/// `4294967295`）曾触发无上限 `with_capacity(len)` 分配（DoS/OOM）。修复后
+/// 超限行按坏行跳过且**上报损坏**，既不预分配也不解析其数据字节，加载不
+/// 恐慌、值保持默认。
+/// docs/DESIGN-DECISIONS.md HOST-02: a saved line whose width no longer matches the OD entry
+/// (the entry's type changed since the store) is *stale*; the load must
+/// report it instead of silently dropping it.
+#[test]
+fn stale_entry_with_mismatched_width_is_reported() {
+    let path = std::env::temp_dir().join(format!(
+        "canopen-rs-test-stale-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&path);
+    let backend = FileStorage::new(path.clone());
+
+    // Store a 4-byte value for 0x6000:1…
+    let mut wide = test_od();
+    wide.insert(
+        Address::new(0x6000, 1),
+        Entry::new(
+            "persisted",
+            DataType::Unsigned32,
+            AccessType::Rw,
+            Storage::Value(Value::Uint(0xDEAD_BEEF)),
+        )
+        .persistent(),
+    );
+    backend.save(&wide).unwrap();
+
+    // …then load into a dictionary where the entry is only 2 bytes wide.
+    let mut narrow = test_od();
+    let err = backend.load(&mut narrow).expect_err("stale 行必须上报");
+    assert!(err.to_string().contains("stale"), "实际：{err}");
+    assert_eq!(
+        narrow.read(Address::new(0x6000, 1)).unwrap(),
+        Value::Uint(111),
+        "the default survives"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn m7_oversized_len_line_is_skipped() {
     let path = std::env::temp_dir().join(format!("canopen_rs_m7_{}.bin", std::process::id()));
@@ -229,13 +282,69 @@ fn m7_oversized_len_line_is_skipped() {
     entry.persistent = true;
     od.insert(Address::new(0x6000, 1), entry);
     let backend = FileStorage::new(path.clone());
-    // 不恐慌、不 OOM；坏行被跳过，值保持默认 111。
-    backend.load(&mut od).unwrap();
+    // 不恐慌、不 OOM；坏行被跳过并上报，值保持默认 111。
+    let err = backend.load(&mut od).expect_err("坏行必须上报");
+    assert!(err.to_string().contains("corrupt"), "实际：{err}");
     assert_eq!(od.read(Address::new(0x6000, 1)).unwrap(), Value::Uint(111));
     let _ = std::fs::remove_file(&path);
 }
 
-/// BUGS.md M8：`save` 遇到条目编码失败（如取值越界 `encode_as` 报错）必须
+/// docs/DESIGN-DECISIONS.md G7：v1 旧文件（无 CRC）必须继续可读，避免升级后所有设备启动即
+/// 报存储损坏。
+#[test]
+fn legacy_v1_file_still_loads() {
+    let path = std::env::temp_dir().join(format!("canopen_rs_v1_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(
+        &path,
+        "# canopen-rs parameter storage v1\n6000 001 02 ef be\n",
+    )
+    .unwrap();
+
+    let mut od = test_od();
+    let backend = FileStorage::new(path.clone());
+    backend.load(&mut od).expect("v1 file must load");
+    assert_eq!(
+        od.read(Address::new(0x6000, 1)).unwrap(),
+        Value::Uint(0xBEEF)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// docs/DESIGN-DECISIONS.md G7：v2 行被篡改（CRC 不符）必须上报为损坏；同一文件中完好的
+/// 条目仍被应用，损坏条目保持当前值。
+#[test]
+fn corrupt_crc_line_is_reported_and_good_entries_still_load() {
+    use canopen_core::sdo::block::crc16;
+
+    let path = std::env::temp_dir().join(format!("canopen_rs_crc_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    // 0x6000:1 完好（值 0x0BEEF），0x6000:2 的 CRC 故意错一位。
+    let good = format!("6000 001 02 ef be {:04x}", crc16(b"6000 001 02 ef be"));
+    let mut bad_crc = crc16(b"6000 002 02 22 22");
+    bad_crc ^= 1;
+    std::fs::write(
+        &path,
+        format!("# canopen-rs parameter storage v2\n{good}\n6000 002 02 22 22 {bad_crc:04x}\n"),
+    )
+    .unwrap();
+
+    // test_od 的 0x6000:2 默认 222 且非 persistent，直接手工插入条目。
+    let mut od = test_od();
+    let backend = FileStorage::new(path.clone());
+    let err = backend.load(&mut od).expect_err("篡改行必须上报");
+    assert!(err.to_string().contains("corrupt"), "实际：{err}");
+
+    // 好条目已恢复，坏条目保持默认。
+    assert_eq!(
+        od.read(Address::new(0x6000, 1)).unwrap(),
+        Value::Uint(0xBEEF)
+    );
+    assert_eq!(od.read(Address::new(0x6000, 2)).unwrap(), Value::Uint(222));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// docs/DESIGN-DECISIONS.md M8：`save` 遇到条目编码失败（如取值越界 `encode_as` 报错）必须
 /// 上报首个错误并返回 `Err`，而非静默跳过该条目却仍返回 `Ok(())`，造成
 /// 重载时该对象回到默认值的隐蔽数据丢失。
 #[test]
@@ -263,7 +372,7 @@ fn m8_save_reports_encode_error() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// BUGS.md 八M5：`UnicodeString` 条目在 OD 中以 `Value::Str` 存放时，持久化必须
+/// docs/DESIGN-DECISIONS.md 八M5：`UnicodeString` 条目在 OD 中以 `Value::Str` 存放时，持久化必须
 /// 写目标类型的线格式 UTF-16LE（CiA 306 / python-canopen），而不是值的最小
 /// UTF-8 编码——否则重载后 `Str` 漂移为 `Bytes`，后续 SDO 上传把 UTF-8 字节
 /// 当 UTF-16LE 发出，非 ASCII 文本全部乱码。
@@ -308,4 +417,34 @@ fn m5_unicode_string_persists_utf16le() {
     assert_eq!(buf, vec![0xE9, 0x00, 0x2D, 0x4E]);
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// docs/DESIGN-DECISIONS.md 七F7: a persistent entry larger than the reader's `MAX_PARAM_LEN`
+/// cap (8 KiB) must fail the save up front with the real reason, instead of
+/// being written and then rejected by the post-write verification as an
+/// opaque "corrupt line".
+#[test]
+fn f7_oversized_persistent_entry_fails_save_cleanly() {
+    let path = std::env::temp_dir().join(format!("canopen_rs_f7_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let backend = FileStorage::new(path.clone());
+
+    let mut od = ObjectDictionary::new();
+    let mut entry = Entry::new(
+        "big",
+        DataType::Domain,
+        AccessType::Rw,
+        Storage::Value(Value::Bytes(vec![0u8; 8193])),
+    );
+    entry.persistent = true;
+    od.insert(Address::new(0x6000, 1), entry);
+
+    let err = backend
+        .save(&od)
+        .expect_err("an over-limit persistent entry must fail the save");
+    assert!(
+        err.to_string().contains("8193") && err.to_string().contains("limit"),
+        "error must name the real reason: {err}"
+    );
+    assert!(!path.exists(), "nothing may be written for a rejected save");
 }

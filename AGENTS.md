@@ -1,8 +1,8 @@
 # AGENTS.md
 
 ## 每次任务前必读
-- **开始任何编辑/修复任务前，先重新阅读 `BUGS.md`**：它是当前权威的、随修复持续更新的已核实 bug 清单。不要依赖记忆或上一轮会话中的 bug 状态——已修复项会随时从清单删除，未修复项也可能新增。先读再动手，避免对已修复项重复劳动或误判未修复项。
-- 修复 bug 后**同步更新 `BUGS.md`**（删除/标注已修复条目），并保持 `cargo test`/`clippy -D warnings`/`cargo fmt --check`/python oracle 四类门禁全绿。
+- **开始任何编辑/修复任务前，先阅读 `docs/DESIGN-DECISIONS.md` 与 `docs/VERIFICATION.md`**：前者记录设计取舍、参考无锚点裁决与已排除误报，后者记录当前门禁和实板验证；当前未修复 bug 为 0。不要重新创建旧 bug 台账，历史变更见 git。
+- 修复/调整行为后同步相关设计文档与验证记录，并保持 `cargo test`/`clippy -D warnings`/`cargo fmt --check`/python oracle 四类门禁全绿。
 
 Rust CANopen stack (CiA 301/305/306), Linux/SocketCAN. Workspace of 3 crates:
 `core` (sans-I/O protocol core), `host` (blocking + tokio transports, EDS,
@@ -34,9 +34,9 @@ MSRV 1.75, edition 2021.
   `ref/CANopenLinux/CANopenNode`. When unsure about CiA semantics, diff against these rather than guessing.
 - EDS parser keeps `$NODEID+offset` **lazy** (resolved per node id, not at parse time).
 
-## Known bugs to consult before editing
+## Known decisions to consult before editing
 
-`BUGS.md` 是权威的已核实 bug 清单（仅列未修复项，随修复持续更新）。编辑相关模块前先读它，避免与已知未修复项冲突或重复劳动。
+`docs/DESIGN-DECISIONS.md` 记录设计取舍、参考无锚点裁决与已排除误报；`docs/VERIFICATION.md` 记录门禁与实板验证。编辑相关模块前先读它们，避免重新引入已裁决差异或重复调查已知误报。
 
 ## Conventions / gotchas
 

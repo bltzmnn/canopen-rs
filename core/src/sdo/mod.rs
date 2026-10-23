@@ -29,7 +29,7 @@ pub mod client;
 pub mod server;
 
 pub use client::{SdoClient, SdoEvent, BLOCK_THRESHOLD};
-pub use server::SdoServer;
+pub use server::{SdoServer, SdoServerConfig};
 
 /// CiA 301 SDO abort codes.
 ///
@@ -339,7 +339,7 @@ pub fn encode_download_response(addr: Address) -> SdoPayload {
 /// # Errors
 /// [`Error::UnexpectedFrame`] if not a download-initiate response.
 ///
-/// Decoder leniency note (`BUGS.md` R10-P3): command-specifier matching in
+/// Decoder leniency note (`docs/DESIGN-DECISIONS.md` R10-P3): command-specifier matching in
 /// these decoders is mask-based and tolerant of stray low bits by design —
 /// strict per-byte frame classification lives in the state machines, and any
 /// junk that slips past still fails address/index checks downstream.
@@ -452,7 +452,11 @@ pub struct Segment<'a> {
     pub toggle: bool,
     /// Whether this is the final segment of the transfer.
     pub last: bool,
-    /// Payload bytes (0..=7; empty allowed only with `last`).
+    /// Payload bytes (0..=7). CiA 301 requires the empty payload to appear
+    /// only on the final segment; this codec encodes and decodes an empty
+    /// non-final segment without complaint, matching both reference stacks
+    /// (python `server.py:160-181`, CANopenNode `CO_SDOserver.c:815-819`) —
+    /// the constraint is on senders, not enforced here (docs/DESIGN-DECISIONS.md SDO-32).
     pub data: &'a [u8],
 }
 
@@ -481,14 +485,23 @@ pub fn decode_download_initiate_segmented(p: &SdoPayload) -> Result<(Address, u3
     Ok((addr_of(p), u32::from_le_bytes([p[4], p[5], p[6], p[7]])))
 }
 
-/// Encodes the server's **segmented upload initiate response** declaring a
-/// transfer of `size` bytes for `addr` (command `0x41`).
+/// Encodes the server's **segmented upload initiate response** for a
+/// transfer of `size` bytes for `addr`. A non-zero size sets the size bit
+/// (`0x41`); a zero size leaves it clear (`0x40`), matching CANopenNode's
+/// size-not-indicated form (`CO_SDOserver.c:1185-1193`). The built-in server
+/// never initiates a zero-length segmented upload — zero-length objects
+/// abort at initiate (`docs/DESIGN-DECISIONS.md` 审-S2) — but the encoder keeps the
+/// reference-compatible zero form for completeness.
 #[must_use]
 pub fn encode_upload_initiate_segmented_response(addr: Address, size: u32) -> SdoPayload {
     let mut p = [0u8; 8];
-    p[0] = SCS_UPLOAD_INITIATE | SIZE_INDICATED;
+    if size > 0 {
+        p[0] = SCS_UPLOAD_INITIATE | SIZE_INDICATED;
+        p[4..8].copy_from_slice(&size.to_le_bytes());
+    } else {
+        p[0] = SCS_UPLOAD_INITIATE;
+    }
     put_addr(&mut p, addr);
-    p[4..8].copy_from_slice(&size.to_le_bytes());
     p
 }
 
@@ -521,7 +534,7 @@ pub fn encode_data_segment(data: &[u8], toggle: bool, last: bool) -> Result<SdoP
     }
     let mut p = [0u8; 8];
     // ccs/scs for a data segment are both 000, so top bits stay clear.
-    // (`BUGS.md` L6: the former `& 0x0E` was redundant — `n <= 7` already
+    // (`docs/DESIGN-DECISIONS.md` L6: the former `& 0x0E` was redundant — `n <= 7` already
     // bounds `n << 1` to 4 bits.)
     let n = (SEGMENT_DATA_MAX - data.len()) as u8;
     p[0] = n << 1;
@@ -677,7 +690,7 @@ impl SegmentBuffer {
 
     /// Appends a decoded segment.
     ///
-    /// Buffer-layer note (`BUGS.md` R10-P3): this layer does not require the
+    /// Buffer-layer note (`docs/DESIGN-DECISIONS.md` R10-P3): this layer does not require the
     /// final segment to land exactly on the declared size — the
     /// `download_segment` finish step enforces that with
     /// `TypeMismatchLengthLow`, so the codec stays permissive by design.
@@ -723,7 +736,7 @@ mod tests {
 
     #[test]
     fn upload_response_without_size_bit_is_accepted() {
-        // BUGS.md M11: e=1, s=0 (command 0x43-style with s clear → 0x42 for
+        // docs/DESIGN-DECISIONS.md M11: e=1, s=0 (command 0x43-style with s clear → 0x42 for
         // a u32) means "all four bytes are data" — python-canopen and
         // CANopenNode both accept it.
         let mut p = [0u8; 8];

@@ -41,13 +41,25 @@ use crate::sdo::SdoAbortCode;
 use crate::types::{Address, Error, Result};
 
 /// Maximum data bytes carried by one segmented-transfer frame — single
-/// source of truth in the module root (`BUGS.md` L6).
+/// source of truth in the module root (`docs/DESIGN-DECISIONS.md` L6).
 use super::SEGMENT_DATA_MAX;
 
 /// Writes larger than this many bytes automatically use block transfer
 /// (`MAX_BLKSIZE * SEGMENT_DATA_MAX`): beyond one full sub-block, per-segment
 /// acknowledgements start dominating throughput.
 pub const BLOCK_THRESHOLD: usize = MAX_BLKSIZE as usize * SEGMENT_DATA_MAX;
+
+/// Applies CANopenNode's block-download counter-proposal rule: an invalid
+/// server blksize is replaced by 127 rather than aborting the transfer
+/// (`CO_SDOclient.c:665-670`; docs/DESIGN-DECISIONS.md SDO-38). `0` therefore becomes 127,
+/// not 1.
+fn negotiated_blksize(blksize: u8) -> u8 {
+    if super::block::is_valid_blksize(blksize) {
+        blksize
+    } else {
+        MAX_BLKSIZE
+    }
+}
 
 /// Outcome of feeding a response frame to [`SdoClient::on_response`].
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +88,7 @@ enum State {
         expected_toggle: bool,
         /// False until the download-initiate response (0x60) arrives.
         initiated: bool,
-        /// Zero-length segmented transfer (`BUGS.md` R10-P2-4): after the
+        /// Zero-length segmented transfer (`docs/DESIGN-DECISIONS.md` R10-P2-4): after the
         /// initiate response the only thing left to send is the empty final
         /// segment (`c=1`, no data) — `pos == data.len()` cannot be used as
         /// the expedited-completion signal here because both are 0.
@@ -93,6 +105,11 @@ enum State {
         sent_this_sub: u8,
         /// Writer position where the current sub-block began.
         sub_base: usize,
+        /// CRC support as advertised by the server's initiate response: the
+        /// end frame carries a CRC only when this is true, mirroring
+        /// python-canopen's `crc_supported` (`client.py:680,812-814`,
+        /// `docs/DESIGN-DECISIONS.md` R4).
+        peer_crc: bool,
     },
     /// Upload initiate sent, waiting for the response (expedited/segmented).
     AwaitingUpload { addr: Address, dt: DataType },
@@ -104,7 +121,7 @@ enum State {
         expected_toggle: bool,
         /// Server-declared total size (initiate response); segments beyond
         /// it fail the transfer instead of growing the buffer unbounded
-        /// (`BUGS.md` P3-31). `None` falls back to [`MAX_VALUE_LEN`](crate::datatypes::MAX_VALUE_LEN).
+        /// (`docs/DESIGN-DECISIONS.md` P3-31). `None` falls back to [`MAX_VALUE_LEN`](crate::datatypes::MAX_VALUE_LEN).
         size_cap: Option<usize>,
     },
     /// Block upload streaming in.
@@ -122,7 +139,7 @@ enum State {
         /// end frame be recognized. The wire formats of a last segment
         /// (`0x80 | seqno`) with seqno in {65,69,…,93} and of the end frame
         /// (`0xC1`) overlap, so earlier recognition would swallow valid data
-        /// (BUGS.md P1-1).
+        /// (docs/DESIGN-DECISIONS.md P1-1).
         awaiting_end: bool,
     },
 }
@@ -191,7 +208,7 @@ impl SdoClient {
     /// # Errors
     /// [`Error::BadLength`] when `data` is empty — block transfer has no
     /// zero-length representation; route empty values through
-    /// [`Self::write`] (segmented) instead (`BUGS.md` R10-P2-4).
+    /// [`Self::write`] (segmented) instead (`docs/DESIGN-DECISIONS.md` R10-P2-4).
     pub fn write_block(&mut self, addr: Address, data: &[u8]) -> Result<Vec<SdoPayload>> {
         if data.is_empty() {
             return Err(Error::BadLength {
@@ -207,6 +224,7 @@ impl SdoClient {
             sent_end: false,
             sent_this_sub: 0,
             sub_base: 0,
+            peer_crc: false,
         };
         Ok(vec![encode_download_initiate(addr, Some(size), true)])
     }
@@ -222,7 +240,7 @@ impl SdoClient {
             // Zero-length segmented transfer, mirroring python-canopen's
             // `WritableStream` for empty values (`size=0` initiate followed
             // by an empty final segment with `c=1`) — previously rejected
-            // outright while the server happily accepts it (BUGS.md
+            // outright while the server happily accepts it (docs/DESIGN-DECISIONS.md
             // R10-P2-4).
             self.state = State::Downloading {
                 addr,
@@ -265,6 +283,7 @@ impl SdoClient {
                 sent_end: false,
                 sent_this_sub: 0,
                 sub_base: 0,
+                peer_crc: false,
             };
             Ok(vec![encode_download_initiate(addr, Some(size), true)])
         }
@@ -278,7 +297,7 @@ impl SdoClient {
     ///   transaction;
     /// - [`Error::Other`] on an echoed address mismatch (diagnostic for
     ///   "another client occupies this channel"; deliberately not queued as
-    ///   an ABORT, `BUGS.md` P3-30);
+    ///   an ABORT, `docs/DESIGN-DECISIONS.md` P3-30);
     /// - [`Error::ToggleBit`] on segment toggle violations;
     /// - [`Error::CrcMismatch`] when a block transfer's CRC fails;
     /// - [`Error::BadLength`] when the server-declared size or the absolute
@@ -424,6 +443,7 @@ impl SdoClient {
                 mut sent_end,
                 mut sent_this_sub,
                 mut sub_base,
+                mut peer_crc,
             } => {
                 if sent_end {
                     // End response confirms completion (CRC failures arrive
@@ -433,12 +453,30 @@ impl SdoClient {
                 }
                 if !initiated {
                     let neg = decode_download_initiate_response(resp)?;
-                    check_addr(&neg.address, &addr)?;
-                    if !super::block::is_valid_blksize(neg.blksize) {
-                        // BUGS.md 八L7: dedicated abort 0x0504_0002.
-                        return Err(Error::InvalidBlockSize);
+                    if check_addr(&neg.address, &addr).is_err() {
+                        // docs/DESIGN-DECISIONS.md S3: unlike the other call sites (P3-30:
+                        // stay passive towards a third party occupying the
+                        // channel), the block-download initiate is aborted
+                        // explicitly like both references — python-canopen
+                        // `client.py:672-677` (general abort) and
+                        // CANopenNode `CO_SDOclient.c:1225-1228`
+                        // (0x0604_0043); this stack follows the more
+                        // specific parameter-incompatibility code.
+                        self.pending_abort = Some(encode_abort(
+                            addr,
+                            SdoAbortCode::GeneralParameterIncompatibility,
+                        ));
+                        return Err(Error::Other("SDO response address mismatch"));
                     }
-                    writer.start_sub_block(neg.blksize);
+                    // docs/DESIGN-DECISIONS.md SDO-38: align with CANopenNode — clamp an
+                    // invalid counter-proposal to 127 instead of aborting
+                    // (`CO_SDOclient.c:665-670`).
+                    let blksize = negotiated_blksize(neg.blksize);
+                    // The server's response decides whether the end frame
+                    // carries a CRC (python-canopen `client.py:680,812-814`,
+                    // docs/DESIGN-DECISIONS.md R4).
+                    peer_crc = neg.crc_support;
+                    writer.start_sub_block(blksize);
                     initiated = true;
                     sub_base = 0;
                 } else {
@@ -449,24 +487,20 @@ impl SdoClient {
                     if ackseq > sent_this_sub {
                         return Err(Error::UnexpectedFrame);
                     }
+                    // docs/DESIGN-DECISIONS.md SDO-38: an invalid counter-proposal is clamped
+                    // to 127 on both the rewind and normal-continuation path.
+                    let next_blksize = negotiated_blksize(next_blksize);
                     if ackseq < sent_this_sub {
                         // Partial acknowledgement: retransmit from ackseq+1.
-                        // Rewind path validates inside rewind's caller too.
-                        if !super::block::is_valid_blksize(next_blksize) {
-                            return Err(Error::InvalidBlockSize);
-                        }
                         writer.rewind(sub_base, ackseq, next_blksize);
                     } else {
-                        if !super::block::is_valid_blksize(next_blksize) {
-                            return Err(Error::InvalidBlockSize);
-                        }
                         writer.start_sub_block(next_blksize);
                     }
                     sub_base = writer.position();
                     sent_this_sub = 0;
                     if writer.is_done() {
                         // All data acknowledged; close with the end frame.
-                        let end = writer.end_frame(true);
+                        let end = writer.end_frame(peer_crc);
                         sent_end = true;
                         self.state = State::BlockDownloading {
                             addr,
@@ -475,6 +509,7 @@ impl SdoClient {
                             sent_end,
                             sent_this_sub,
                             sub_base,
+                            peer_crc,
                         };
                         return Ok(SdoEvent::Send(vec![end]));
                     }
@@ -491,6 +526,7 @@ impl SdoClient {
                     sent_end,
                     sent_this_sub,
                     sub_base,
+                    peer_crc,
                 };
                 Ok(SdoEvent::Send(frames))
             }
@@ -508,7 +544,7 @@ impl SdoClient {
                     dt,
                     buf: Vec::new(),
                     expected_toggle: false,
-                    // BUGS.md 十M6: a peer-declared size must be capped by the
+                    // docs/DESIGN-DECISIONS.md 十M6: a peer-declared size must be capped by the
                     // absolute maximum, exactly like the block path
                     // (`BlockUploading` size_hint) and the server side.
                     size_cap: size.map(|s| (s as usize).min(crate::datatypes::MAX_VALUE_LEN)),
@@ -529,7 +565,7 @@ impl SdoClient {
                 }
                 // Enforce the server-declared size (and the absolute cap when
                 // undeclared) so a faulty peer cannot grow the buffer
-                // without bound (BUGS.md P3-31).
+                // without bound (docs/DESIGN-DECISIONS.md P3-31).
                 let cap = size_cap.unwrap_or(crate::datatypes::MAX_VALUE_LEN);
                 if buf.len() + seg.data.len() > cap {
                     return Err(Error::BadLength {
@@ -539,7 +575,7 @@ impl SdoClient {
                 }
                 buf.extend_from_slice(seg.data);
                 if seg.last {
-                    // BUGS.md 十M6: a final segment that is shorter than the
+                    // docs/DESIGN-DECISIONS.md 十M6: a final segment that is shorter than the
                     // server-declared size must abort with BadLength
                     // (0x0607_0013) — CANopenNode `CO_SDOclient.c:1299-1307`
                     // does the same, and the server-side guard is symmetric
@@ -584,9 +620,10 @@ impl SdoClient {
                 if !started {
                     // Server-side protocol switch (CiA): a segmented
                     // initiate response here means "no block transfer" —
-                    // either the object is tiny/empty or our pst asked for
-                    // segmented. Continue as a plain segmented read
-                    // (BUGS.md P3-28/P3-29).
+                    // either the object is tiny or our pst asked for
+                    // segmented (zero-length uploads abort instead,
+                    // `docs/DESIGN-DECISIONS.md` 审-S2). Continue as a plain segmented read
+                    // (docs/DESIGN-DECISIONS.md P3-28; 审-S1).
                     if let Ok((confirmed, size)) = super::decode_upload_initiate_response(resp) {
                         check_addr(&confirmed, &addr)?;
                         self.state = State::Uploading {
@@ -619,7 +656,7 @@ impl SdoClient {
                     // (python-canopen keeps the class attribute 127;
                     // CANopenNode only honours byte 4 in the download
                     // direction) — R10-P2-3 resolved as "keep, documented".
-                    // (`BUGS.md` L6: the byte-4 counter-proposal field was
+                    // (`docs/DESIGN-DECISIONS.md` L6: the byte-4 counter-proposal field was
                     // removed from `BlockInitiate` as dead — nothing read it.)
                     self.state = State::BlockUploading {
                         addr,
@@ -635,7 +672,7 @@ impl SdoClient {
                     };
                     return Ok(SdoEvent::Send(vec![encode_upload_start()]));
                 }
-                // Phase separation (BUGS.md P1-1): the end frame is only
+                // Phase separation (docs/DESIGN-DECISIONS.md P1-1): the end frame is only
                 // recognized after the last segment has been acknowledged.
                 // A last segment's wire form `0x80 | seqno` collides with the
                 // end frame `0xC1` for seqno in {65,69,…,93}, so recognizing
@@ -653,7 +690,7 @@ impl SdoClient {
                 }
                 let seg = super::block::decode_sub_segment(resp);
                 if seg.seqno == 0 || seg.seqno != expected_seqno {
-                    // BUGS.md #24: while awaiting the *renumbered*
+                    // docs/DESIGN-DECISIONS.md #24: while awaiting the *renumbered*
                     // retransmission (expected=1, received=0) any other
                     // sequence number is a stale straggler from the old
                     // window — ignore it without acknowledging, otherwise
@@ -672,7 +709,7 @@ impl SdoClient {
                     // to 0 for exactly this reason), so our expectation
                     // must reset too; keeping the old counter would reject
                     // every retransmitted segment and deadlock the transfer
-                    // until the host deadline (BUGS.md P1-1, see git history).
+                    // until the host deadline (docs/DESIGN-DECISIONS.md P1-1, see git history).
                     self.state = State::BlockUploading {
                         addr,
                         dt,
@@ -689,7 +726,7 @@ impl SdoClient {
                 }
                 // Cap an undeclared/huge size hint by the absolute value
                 // limit so a malicious server cannot grow the buffer without
-                // bound (BUGS.md #2; segmented path has the same guard).
+                // bound (docs/DESIGN-DECISIONS.md #2; segmented path has the same guard).
                 let cap = size_hint.map_or(crate::datatypes::MAX_VALUE_LEN, |s| {
                     (s as usize).min(crate::datatypes::MAX_VALUE_LEN)
                 });
@@ -740,11 +777,13 @@ impl SdoClient {
 
 /// Validates that the response echoes the requested address.
 ///
-/// A mismatch means another client is occupying this SDO channel. We
-/// deliberately do **not** queue an ABORT for it (unlike other protocol
-/// violations): the offender is an unknown third party and interrupting it
-/// could corrupt its transfer — we only abandon our own transaction
-/// (`BUGS.md` P3-30, resolved by documentation).
+/// A mismatch means another client is occupying this SDO channel. The
+/// regular call sites deliberately do **not** queue an ABORT for it (unlike
+/// other protocol violations): the offender is an unknown third party and
+/// interrupting it could corrupt its transfer — we only abandon our own
+/// transaction (`docs/DESIGN-DECISIONS.md` P3-30, resolved by documentation). The
+/// block-download initiate is the exception and queues the ABORT at its
+/// call site (`docs/DESIGN-DECISIONS.md` S3).
 fn check_addr(confirmed: &Address, requested: &Address) -> Result<()> {
     if confirmed != requested {
         return Err(Error::Other("SDO response address mismatch"));
@@ -776,7 +815,7 @@ mod tests {
 
     #[test]
     fn protocol_error_queues_abort_frame() {
-        // BUGS.md M10: a protocol violation must queue an ABORT for the
+        // docs/DESIGN-DECISIONS.md M10: a protocol violation must queue an ABORT for the
         // server (python-canopen aborts before raising) instead of leaving
         // it hanging until its own timeout.
         let mut c = SdoClient::new();
@@ -801,7 +840,7 @@ mod tests {
 
     #[test]
     fn block_upload_server_expedited_fallback_completes() {
-        // BUGS.md 十M26: a server may answer a block-upload initiate with an
+        // docs/DESIGN-DECISIONS.md 十M26: a server may answer a block-upload initiate with an
         // expedited upload response (python-canopen's server does for ≤4-byte
         // objects); the client must complete instead of aborting.
         let mut c = SdoClient::new();
@@ -863,19 +902,85 @@ mod tests {
     }
 
     #[test]
-    fn l7_invalid_server_blksize_gets_dedicated_abort() {
-        // BUGS.md 八L7: a server counter-proposing an illegal blksize must
-        // be aborted with 0x0504_0002, not a generic error.
+    fn invalid_server_blksize_is_clamped_to_127() {
+        // docs/DESIGN-DECISIONS.md SDO-38: CANopenNode replaces an invalid blksize
+        // counter-proposal with 127 and continues (`CO_SDOclient.c:665-670`);
+        // it does not abort. The first sub-block therefore carries 127
+        // segments and no ABORT is queued.
         let mut c = SdoClient::new();
         let addr = Address::new(0x2000, 0);
         let _ = c.write(addr, &[0xAB; BLOCK_THRESHOLD + 1]).unwrap();
 
         let resp = crate::sdo::block::encode_download_initiate_response(addr, 0, false);
+        match c.on_response(&resp).expect("clamped, not aborted") {
+            SdoEvent::Send(frames) => {
+                assert_eq!(frames.len(), usize::from(MAX_BLKSIZE));
+                assert_eq!(frames[0][0], 0x01, "sequence starts at 1");
+                assert_eq!(frames[126][0], 127);
+            }
+            other => panic!("expected a sub-block, got {other:?}"),
+        }
+        assert!(c.take_pending_abort().is_none());
+    }
+
+    #[test]
+    fn block_download_end_frame_follows_negotiated_crc() {
+        // docs/DESIGN-DECISIONS.md R4: the end frame carries a CRC only when the server's
+        // initiate response advertises CRC support — python-canopen stores
+        // `crc_supported` from the response (`client.py:680`) and packs the
+        // CRC conditionally (`client.py:812-814`).
+        use crate::sdo::block::{
+            crc16, decode_end, encode_download_initiate_response, encode_sub_response,
+        };
+        for server_crc in [false, true] {
+            let mut c = SdoClient::new();
+            let addr = Address::new(0x2000, 0);
+            let data = vec![0xAB; 20];
+            let _ = c.write_block(addr, &data).unwrap();
+
+            let init = encode_download_initiate_response(addr, 127, server_crc);
+            let frames = match c.on_response(&init).unwrap() {
+                SdoEvent::Send(f) => f,
+                other => panic!("expected segments, got {other:?}"),
+            };
+            assert_eq!(frames.len(), 3, "20 bytes in 7-byte segments");
+
+            // Acknowledge the whole sub-block; all data is out, so the next
+            // send is the end frame.
+            let ack = encode_sub_response(3, 127);
+            let end = match c.on_response(&ack).unwrap() {
+                SdoEvent::Send(f) => {
+                    assert_eq!(f.len(), 1);
+                    f[0]
+                }
+                other => panic!("expected end frame, got {other:?}"),
+            };
+            let (_, crc) = decode_end(&end).unwrap();
+            let expected = if server_crc { crc16(&data) } else { 0 };
+            assert_eq!(crc, expected, "server_crc={server_crc}");
+        }
+    }
+
+    #[test]
+    fn s3_block_download_address_mismatch_aborts_the_peer() {
+        // docs/DESIGN-DECISIONS.md S3: unlike the other `check_addr` call sites (P3-30,
+        // stay passive), a block-download initiate naming the wrong object
+        // is aborted explicitly — python-canopen `client.py:672-677`,
+        // CANopenNode `CO_SDOclient.c:1225-1228`.
+        use crate::sdo::block::encode_download_initiate_response;
+        let mut c = SdoClient::new();
+        let addr = Address::new(0x2000, 0);
+        let _ = c.write_block(addr, &[0xAB; 20]).unwrap();
+
+        let other = Address::new(0x2001, 0);
+        let resp = encode_download_initiate_response(other, 127, false);
         let err = c.on_response(&resp).unwrap_err();
-        assert!(matches!(err, Error::InvalidBlockSize), "got {err:?}");
+        assert!(matches!(err, Error::Other(_)), "got {err:?}");
 
         let abort = c.take_pending_abort().expect("abort queued");
-        let (_, code) = crate::sdo::decode_abort(&abort).unwrap();
-        assert_eq!(code, SdoAbortCode::InvalidBlockSize);
+        let (aborted_addr, code) = crate::sdo::decode_abort(&abort).unwrap();
+        assert_eq!(code, SdoAbortCode::GeneralParameterIncompatibility);
+        assert_eq!(aborted_addr, addr, "abort names our in-flight object");
+        assert!(c.is_idle(), "transaction abandoned");
     }
 }

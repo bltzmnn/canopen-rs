@@ -114,7 +114,7 @@ fn default_value_number_formats() {
     );
 }
 
-/// Non-ASCII unquoted DefaultValue must not crash the parser (BUGS.md P2,
+/// Non-ASCII unquoted DefaultValue must not crash the parser (docs/DESIGN-DECISIONS.md P2,
 /// third-round review): the `$NODEID` probe used to slice `body[..7]`,
 /// panicking when byte 7 fell inside a multi-byte character. Such a value
 /// is simply not a `$NODEID` expression and degrades like any other
@@ -140,7 +140,7 @@ DefaultValue=你好世界
     );
 }
 
-/// BUGS.md 八L8: `NodeIDSet` is a boolean commissioning flag, not a node id.
+/// docs/DESIGN-DECISIONS.md 八L8: `NodeIDSet` is a boolean commissioning flag, not a node id.
 #[test]
 fn nodeid_set_is_not_a_node_id() {
     let text = r#"
@@ -154,7 +154,7 @@ NodeIDSet=1
     );
 }
 
-/// BUGS.md 八L9: any non-zero PDOMapping marks the object mappable
+/// docs/DESIGN-DECISIONS.md 八L9: any non-zero PDOMapping marks the object mappable
 /// (CANFestival's `2` = "RPDO only" must not be rejected).
 #[test]
 fn pdo_mapping_two_is_mappable() {
@@ -174,7 +174,7 @@ PDOMapping=2
     );
 }
 
-/// BUGS.md 八L10: `DefaultValue=+0x8000` (explicit plus) parses like python's
+/// docs/DESIGN-DECISIONS.md 八L10: `DefaultValue=+0x8000` (explicit plus) parses like python's
 /// `int(value, 0)` instead of failing the whole import.
 #[test]
 fn plus_signed_hex_default_parses() {
@@ -194,7 +194,7 @@ DefaultValue=+0x1234
     );
 }
 
-/// BUGS.md A3: a non-finite float default (`1e999` parses to `f64::INFINITY`)
+/// docs/DESIGN-DECISIONS.md A3: a non-finite float default (`1e999` parses to `f64::INFINITY`)
 /// must generate a valid Rust literal instead of `Value::Real(inf)`, which
 /// did not compile. Both build exits (codegen and runtime) must accept it.
 #[test]

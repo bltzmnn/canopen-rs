@@ -48,7 +48,7 @@ pub mod err_reg {
 /// Default number of history slots (and 0x1003 sub-entries).
 pub const HISTORY_CAPACITY: usize = 8;
 
-/// `EmcyConsumer::active` 的容量上限（BUGS.md M5）：防止恶意/故障节点通过
+/// `EmcyConsumer::active` 的容量上限（docs/DESIGN-DECISIONS.md M5）：防止恶意/故障节点通过
 /// 持续发送不同 EMCY 码使消费者活动表无界增长、耗尽内存。与 `log` 同款环形上限。
 pub const ACTIVE_CAPACITY: usize = 256;
 
@@ -66,6 +66,10 @@ pub fn describe_code(code: u16) -> &'static str {
         0x6000..=0x6FFF => "software inefficiency",
         0x7000..=0x7FFF => "additional modules",
         0x8000 => "monitoring",
+        // `0x8100` is CANopenNode's generic communication code
+        // (`CO_Emergency.h:138`); the specific error bit travels in the first
+        // manufacturer byte (this stack emits it for the SYNC-timeout
+        // supervision, docs/DESIGN-DECISIONS.md SYN-01).
         0x8100 => "communication",
         // Aligned with CANopenNode `CO_Emergency.h:138-148` (十L3); the
         // 0x82xx codes below are emitted by this stack itself.
@@ -84,7 +88,7 @@ pub fn describe_code(code: u16) -> &'static str {
         0xF000..=0xFEFF => "additional functions",
         // CiA 301 / python-canopen `emcy.py:121-122`: the 0xFFxx block is
         // device specific, not part of the additional-functions range
-        // (BUGS.md 八L16).
+        // (docs/DESIGN-DECISIONS.md 八L16).
         0xFF00..=0xFFFF => "device specific",
         _ => "reserved / manufacturer specific",
     }
@@ -138,6 +142,11 @@ struct Condition {
     code: u16,
     register_bits: u8,
     info: [u8; 5],
+    /// Global error-register snapshot frozen when this condition entered the
+    /// history (bits 16..23 of the 0x1003 word); never rewritten afterwards —
+    /// CANopenNode ORs the register in once at dequeue time
+    /// (`CO_Emergency.c:578`) and the stored word stays put (`docs/DESIGN-DECISIONS.md` EMC-13).
+    register: u8,
 }
 
 /// EMCY producer: maintains active conditions, the error register and the
@@ -177,7 +186,7 @@ impl EmcyProducer {
         info: [u8; 5],
     ) -> Option<[u8; 8]> {
         if let Some(cond) = self.active.get_mut(&code) {
-            // BUGS.md L1: a repeated raise of an already-active code still
+            // docs/DESIGN-DECISIONS.md L1: a repeated raise of an already-active code still
             // merges any *new* error-register bits into the condition (and
             // refreshes 0x1001) — previously the idempotent early-return
             // left the register stale when the same code surfaced through a
@@ -186,7 +195,7 @@ impl EmcyProducer {
             if register_changed {
                 cond.register_bits |= register_bits;
             }
-            // BUGS.md H2: the idempotent path must also keep the vendor info
+            // docs/DESIGN-DECISIONS.md H2: the idempotent path must also keep the vendor info
             // field fresh — a re-raise with newer data used to discard it,
             // so a later re-announcement (or 0x1003 mirror) carried stale
             // bytes.
@@ -198,27 +207,30 @@ impl EmcyProducer {
             }
             return None; // idempotent: no new frame
         }
-        let cond = Condition {
+        let mut cond = Condition {
             code,
             register_bits,
             info,
+            register: 0,
         };
-        // History: newest first. A full ring drops the *new* entry and only
-        // sets the sticky overflow flag — CANopenNode `CO_Emergency.c:695-706`
-        // (`if (fifoWrPtrNext == fifoPpPtr) { fifoOverflow = 1; } else
-        // { store }`) never evicts the oldest message. The flag is
-        // reportable via [`Self::overflowed`] and cleared when the history
-        // is emptied (`CO_EM_EMERGENCY_BUFFER_FULL` resets once the fifo has
-        // drained, `:597-603`).
-        if self.history.len() < HISTORY_CAPACITY {
-            self.history.push_front(cond);
-        } else {
-            self.overflow = true;
-        }
         self.active.insert(code, cond);
+        // History: newest first and *rolling* — a full ring evicts the oldest
+        // slot (docs/DESIGN-DECISIONS.md EMC-12). CANopenNode's reader advances `fifoPpPtr` as
+        // messages are sent (`CO_Emergency.c:593-595`), so the write pointer
+        // wraps onto the oldest sent slot; `:695-706` is the writer/reader
+        // catch-up guard that flags *transport* overflow, not a history
+        // eviction policy, and `OD_read_1003` always exposes the most recent
+        // `fifoCount` entries (`:175-185`). A frame the node really dropped is
+        // signalled separately by the sticky overflow flag (`Node` sets it
+        // when `pending_emcy` is full, docs/DESIGN-DECISIONS.md EMC-02).
+        let register = self.error_register();
+        cond.register = register;
+        if self.history.len() >= HISTORY_CAPACITY {
+            self.history.pop_back();
+        }
+        self.history.push_front(cond);
         self.sync_od(od);
 
-        let register = self.error_register();
         Some(
             EmcyFrame {
                 code,
@@ -229,9 +241,18 @@ impl EmcyProducer {
         )
     }
 
-    /// 返回当前所有 active 条件的 EMCY 帧载荷，供节点在进入 Operational 时
-    /// 补发。节点在 Op 之前锁存的故障仅被记录、因 [`Self::raise`] 幂等而从不
-    /// 出帧（BUGS.md B3-2）；借此通道重发，避免上位机误判健康。
+    /// 返回当前所有 active 条件的 EMCY 帧载荷（`[code, register, info..]`，已
+    /// 编码）。
+    ///
+    /// **不再被 [`Node`](crate::node::Node) 调用**：节点在进入 Operational 时对
+    /// 全部 active 条件补发，会把上一个 Operational 周期**已经发过**的条件再发
+    /// 一遍，而参考只出队「未发送」的 fifo 条目（`CO_Emergency.c:571-582`）。
+    /// 自 EMC-15 起每个 raise/clear 帧都无条件入 `pending_emcy`（生产禁用时也
+    /// 入队），`poll` 在能发送时逐个出队，Op 前锁存的故障由队列覆盖，B3-2 的
+    /// 目标已经达成而无需重复广播（docs/DESIGN-DECISIONS.md EMC-06、EMC-15）。
+    ///
+    /// 保留为公开 API 供「诊断/自检」用途，例如让应用在查询时拿到当前全部
+    /// 故障的帧形态。
     pub fn reannounce_active(&self) -> Vec<[u8; 8]> {
         self.active
             .values()
@@ -253,17 +274,41 @@ impl EmcyProducer {
     /// `None` when the code was not active.
     ///
     /// A `0x0000` frame tells consumers "this node is fully recovered" — the
-    /// [`EmcyConsumer`] wipes the node's entire active table on it — so
-    /// emitting it while other errors are still active would desynchronise
-    /// producer and consumer (BUGS.md M2).
+    /// [`EmcyConsumer`] wipes the node's entire active table on the whole
+    /// `0x00xx` reset family, so emitting it while other errors are still
+    /// active would desynchronise producer and consumer. CANopenNode's
+    /// `CO_errorReset` does exactly that (one `0x0000` frame per reset error
+    /// bit, remaining bits still set: `CO_Emergency.c:639-720`); this stack
+    /// deliberately re-announces the lowest remaining code instead
+    /// (`docs/DESIGN-DECISIONS.md` 七F4b).
     pub fn clear(&mut self, od: &mut ObjectDictionary, code: u16) -> Option<[u8; 8]> {
+        self.clear_with_info(od, code, [0; 5])
+    }
+
+    /// Clears a condition, carrying `reset_info` in the manufacturer field of
+    /// the resulting reset/no-error frame.
+    ///
+    /// CANopenLinux's `CO_errorReset(em, errorBit, infoCode)` stores the
+    /// caller's infoCode next to `CO_EMC_NO_ERROR` when the cleared bit was
+    /// the last one standing (`CO_Emergency.c:668,673-675` — the same `errMsg`
+    /// / `infoCodeSwapped` pair as the raise path, with `errorCode` forced to
+    /// `CO_EMC_NO_ERROR`), so a master sees *how long* the recovered
+    /// condition had been pending. [`Self::clear`] passes zeros; callers that
+    /// know the measured value (e.g. the RPDO dead-line timer, `CO_PDO.c:823`)
+    /// use this entry point.
+    pub fn clear_with_info(
+        &mut self,
+        od: &mut ObjectDictionary,
+        code: u16,
+        reset_info: [u8; 5],
+    ) -> Option<[u8; 8]> {
         self.active.remove(&code)?;
         self.sync_od(od);
         let frame = if self.active.is_empty() {
             EmcyFrame {
                 code: 0x0000,
                 register: self.error_register(),
-                data: [0; 5],
+                data: reset_info,
             }
         } else {
             // Re-announce the remaining highest-priority condition: the
@@ -278,13 +323,15 @@ impl EmcyProducer {
         Some(frame.encode())
     }
 
-    /// Clears the whole error history and the overflow flag, mirroring the
-    /// reset into 0x1003 (sub 0 back to the history entry count, i.e. 0).
-    /// Invoked when the application writes zero to 0x1003:0 — the semantics
-    /// of CANopenNode's `OD_write_1003`.
+    /// Clears the whole error history, mirroring the reset into 0x1003 (sub 0
+    /// back to the history entry count, i.e. 0). Invoked when the application
+    /// writes zero to 0x1003:0 — the semantics of CANopenNode's
+    /// `OD_write_1003`, which clears only the fifo *count* and deliberately
+    /// leaves `fifoOverflow` alone (`CO_Emergency.c:193-213`, docs/DESIGN-DECISIONS.md
+    /// EMC-02); the overflow bit is cleared when the transmit queue drains
+    /// ([`Self::set_overflow`]).
     pub fn clear_history(&mut self, od: &mut ObjectDictionary) {
         self.history.clear();
-        self.overflow = false;
         self.sync_od(od);
     }
 
@@ -294,10 +341,25 @@ impl EmcyProducer {
         self.sync_od(od);
     }
 
-    /// Whether the history overflowed since the last successful raise.
+    /// Whether an EMCY frame was **dropped** (transmit queue full) since the
+    /// flag was last cleared — CANopenNode's `fifoOverflow`.
     #[must_use]
     pub const fn overflowed(&self) -> bool {
         self.overflow
+    }
+
+    /// Raises/clears the sticky "EMCY frame lost" flag and refreshes the
+    /// 0x1001 mirror.
+    ///
+    /// Set when the node's pending-transmission queue is full and the new
+    /// frame is really dropped (`CO_Emergency.c:693-709`), cleared once that
+    /// queue has drained (`:598-602`). Writing 0 to 0x1003:0 does **not**
+    /// clear it (see [`Self::clear_history`]).
+    pub fn set_overflow(&mut self, od: &mut ObjectDictionary, overflow: bool) {
+        if self.overflow != overflow {
+            self.overflow = overflow;
+            self.sync_od(od);
+        }
     }
 
     /// Current error-register value (recomputed from active conditions).
@@ -336,13 +398,19 @@ impl EmcyProducer {
         od.set_value(Address::new(0x1003, 0), Value::Uint(count))
             .ok();
         for i in 0..HISTORY_CAPACITY {
-            // Standard error field layout (CANopenNode `CO_Emergency.c:578`):
+            // Standard error field layout (CANopenNode `CO_Emergency.c:578,673`):
             // `errorBit<<24 | register<<16 | code`. This stack has no
-            // errorBit dimension, but the error register belongs in bits
-            // 16..23 (previously only the 16-bit code was written).
-            let value = self.history.get(i).map_or(0, |c| {
-                (u64::from(c.register_bits) << 16) | u64::from(c.code)
-            });
+            // errorBit dimension, but bits 16..23 carry the error register
+            // that was current when the entry entered the history — frozen
+            // per entry, exactly like the reference's one-time
+            // `msg |= (uint32_t)errorRegister << 16` at dequeue time
+            // (`CO_Emergency.c:578`; docs/DESIGN-DECISIONS.md EMC-13). Rewriting every entry
+            // from the *current* register made finished error episodes lose
+            // their register bits as soon as the last fault cleared.
+            let value = self
+                .history
+                .get(i)
+                .map_or(0, |c| (u64::from(c.register) << 16) | u64::from(c.code));
             od.set_value(Address::new(0x1003, i as u8 + 1), Value::Uint(value))
                 .ok();
         }
@@ -355,7 +423,8 @@ pub type EmcyCallback = Box<dyn Fn(&NodeId, &EmcyFrame) + Send>;
 /// Consumer-side listener state (python-canopen `emcy.py` semantics):
 ///
 /// - bounded recent-error log,
-/// - **active** table per node cleared by error-reset frames (`code 0x0000`),
+/// - **active** table per node cleared by error-reset frames (the whole
+///   `0x00xx` family, python `emcy.py:33-35` checks `code & 0xFF00 == 0`),
 /// - registered callbacks invoked in registration order with panic
 ///   isolation — one failing callback never breaks the others or the
 ///   caller (docs/REFERENCES.md V6/V11 fixes).
@@ -384,7 +453,7 @@ impl EmcyConsumer {
     /// A consumer keeping the last `capacity` frames.
     ///
     /// A `capacity` of 0 is clamped to 1 so the ring always holds at least
-    /// the newest event (`BUGS.md` R10-P3, documented).
+    /// the newest event (`docs/DESIGN-DECISIONS.md` R10-P3, documented).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -401,22 +470,23 @@ impl EmcyConsumer {
     }
 
     /// Records one decoded frame: updates the log, the active table
-    /// (reset code `0x0000` clears that node's entries) and invokes all
-    /// callbacks with panic isolation. Returns the frame for event dispatch.
+    /// (the `0x00xx` error-reset family clears that node's entries) and
+    /// invokes all callbacks with panic isolation. Returns the frame for
+    /// event dispatch.
     pub fn on_frame(&mut self, node: NodeId, frame: EmcyFrame) -> EmcyFrame {
         if self.log.len() == self.capacity {
             self.log.pop_back();
         }
         self.log.push_front((node, frame));
 
-        if frame.code == 0x0000 {
+        if frame.code & 0xFF00 == 0 {
             self.active.retain(|(n, _)| *n != node.get());
         } else if !self
             .active
             .iter()
             .any(|(n, c)| *n == node.get() && *c == frame.code)
         {
-            // BUGS.md M5: `active` 此前完全无界——任一远端在订阅 COB 上发 N
+            // docs/DESIGN-DECISIONS.md M5: `active` 此前完全无界——任一远端在订阅 COB 上发 N
             // 个不同 EMCY 码即可无界追加，令消费者内存耗尽。与 `log` 同款
             // 上限，超出时丢弃最旧条目（环形语义）。
             if self.active.len() >= ACTIVE_CAPACITY {
@@ -506,7 +576,7 @@ mod tests {
     fn read_reg(od: &ObjectDictionary) -> u64 {
         match od.read(Address::new(0x1001, 0)).unwrap() {
             Value::Uint(v) => v,
-            // BUGS.md L5: the standard OD installs 0x1001 as Uint — any
+            // docs/DESIGN-DECISIONS.md L5: the standard OD installs 0x1001 as Uint — any
             // other type means the test harness mis-configured it.
             _ => unreachable!("0x1001 must be an Unsigned value"),
         }
@@ -514,7 +584,7 @@ mod tests {
 
     #[test]
     fn error_register_bits_match_cia301() {
-        // BUGS.md A1: bit 6 is reserved (always 0), bit 7 is manufacturer
+        // docs/DESIGN-DECISIONS.md A1: bit 6 is reserved (always 0), bit 7 is manufacturer
         // specific (CANopenNode `CO_Emergency.h:107-108`); the two were
         // previously swapped.
         assert_eq!(err_reg::RESERVED, 0x40);
@@ -543,30 +613,42 @@ mod tests {
     }
 
     #[test]
-    fn full_recovery_keeps_overflow_until_history_cleared() {
-        // BUGS.md 十M20: a full history drops the *new* entry and sets the
-        // sticky overflow flag; clearing active conditions does not consume
-        // the history, so the flag leaves only when the history is emptied
-        // (CANopenNode `CO_EM_EMERGENCY_BUFFER_FULL` resets once the fifo
-        // has drained, `CO_Emergency.c:597-603`).
+    fn overflow_tracks_dropped_frames_not_history_full() {
+        // docs/DESIGN-DECISIONS.md EMC-02: the sticky overflow flag means "an EMCY frame was
+        // really dropped" (CANopenNode's `fifoOverflow`), so filling the
+        // *history* ring — whose entries were all transmitted — must not set
+        // it; the node sets it when its transmit queue is full and clears it
+        // when that queue drains.
         let mut em = EmcyProducer::new();
         let mut od = od();
         for i in 0..=HISTORY_CAPACITY as u16 {
             em.raise(&mut od, 0x1000 + i, err_reg::GENERIC, [0; 5]);
         }
+        assert!(
+            !em.overflowed(),
+            "a full history is not a transport overflow"
+        );
+        assert_eq!(read_reg(&od), u64::from(err_reg::GENERIC));
+
+        // A dropped frame sets it (and mirrors into 0x1001)…
+        em.set_overflow(&mut od, true);
         assert!(em.overflowed());
         assert_eq!(read_reg(&od), u64::from(err_reg::GENERIC));
 
-        // Clear all codes; the overflow indication survives.
+        // …wiping the history (0x1003:0 write) does NOT clear it
+        // (`OD_write_1003` only touches the fifo count, `:193-213`)…
+        em.clear_history(&mut od);
+        assert!(em.overflowed());
+
+        // …and draining the transmit queue does.
+        em.set_overflow(&mut od, false);
+        assert!(!em.overflowed());
+        // The active conditions still hold their register bits…
+        assert_eq!(read_reg(&od), u64::from(err_reg::GENERIC));
         for i in 0..=HISTORY_CAPACITY as u16 {
             em.clear(&mut od, 0x1000 + i);
         }
-        assert!(em.overflowed());
-        assert_eq!(read_reg(&od), u64::from(err_reg::GENERIC));
-
-        // Only wiping the history (0x1003:0 write) resets the flag.
-        em.clear_history(&mut od);
-        assert!(!em.overflowed());
+        // …so only clearing them all drops the register to zero.
         assert_eq!(read_reg(&od), 0);
     }
 
@@ -594,7 +676,7 @@ mod tests {
         assert_eq!(em.active_codes(), vec![0x2310, 0x4210]);
     }
 
-    /// BUGS.md H2: an idempotent re-raise of an already-active code must
+    /// docs/DESIGN-DECISIONS.md H2: an idempotent re-raise of an already-active code must
     /// keep the vendor info field fresh — previously the idempotent path
     /// discarded newer `info`, so a later re-announcement carried stale
     /// bytes.
@@ -617,7 +699,7 @@ mod tests {
 
     #[test]
     fn producer_carries_full_manufacturer_field() {
-        // BUGS.md P2-2: CiA 301 gives EMCY frames a five-byte manufacturer
+        // docs/DESIGN-DECISIONS.md P2-2: CiA 301 gives EMCY frames a five-byte manufacturer
         // field (frame byte3..byte7); the producer must transmit all five.
         let mut em = EmcyProducer::new();
         let mut od = od();
@@ -635,7 +717,7 @@ mod tests {
         em.raise(&mut od, 0x4210, err_reg::TEMPERATURE, [0; 5])
             .unwrap();
 
-        // BUGS.md M2: clearing one of several active codes must NOT emit a
+        // docs/DESIGN-DECISIONS.md M2: clearing one of several active codes must NOT emit a
         // 0x0000 "all clear" frame — the remaining highest-priority
         // (lowest) code is re-announced instead, so consumers keep it
         // active.
@@ -655,7 +737,7 @@ mod tests {
 
     #[test]
     fn producer_never_emits_false_all_clear() {
-        // BUGS.md M2 regression: a producer clearing one of several errors
+        // docs/DESIGN-DECISIONS.md M2 regression: a producer clearing one of several errors
         // must not emit 0x0000 — consumers wipe the node's whole active
         // table on that code, so a false "all clear" desynchronises them
         // (and a CANopenNode master would misjudge the node recovered).
@@ -692,13 +774,16 @@ mod tests {
             em.raise(&mut od, 0x2000 + i, err_reg::GENERIC, [0; 5])
                 .unwrap();
         }
-        // Capacity 8: the *newest* entries are dropped (CANopenNode never
-        // evicts the oldest message, `CO_Emergency.c:695-706`); overflow set.
-        assert!(em.overflowed());
+        // Capacity 8: the ring keeps a rolling window of the *newest*
+        // entries — the oldest slot is evicted, mirroring CANopenNode's
+        // reader-advanced fifo (`CO_Emergency.c:593-595,695-706`;
+        // docs/DESIGN-DECISIONS.md EMC-12). The frames themselves are transmitted, so a full
+        // history is not a transport overflow (docs/DESIGN-DECISIONS.md EMC-02).
+        assert!(!em.overflowed());
         let hist: Vec<u16> = em.history().map(|(c, _)| c).collect();
         assert_eq!(
             hist,
-            vec![0x2007, 0x2006, 0x2005, 0x2004, 0x2003, 0x2002, 0x2001, 0x2000]
+            vec![0x2009, 0x2008, 0x2007, 0x2006, 0x2005, 0x2004, 0x2003, 0x2002]
         );
 
         // 0x1003 mirrors the same ring: sub0=count, sub1=newest — with the
@@ -707,6 +792,48 @@ mod tests {
         assert_eq!(
             od.read(Address::new(0x1003, 1)).unwrap(),
             Value::Uint((u64::from(err_reg::GENERIC) << 16) | u64::from(hist[0]))
+        );
+        // The oldest two raises (0x2000/0x2001) fell out of the window.
+        assert_eq!(
+            od.read(Address::new(0x1003, 8)).unwrap(),
+            Value::Uint((u64::from(err_reg::GENERIC) << 16) | 0x2002)
+        );
+    }
+
+    /// docs/DESIGN-DECISIONS.md EMC-13: the register bits of a history entry are frozen when
+    /// it is recorded — clearing a later fault must not retroactively
+    /// rewrite the stored register state of earlier episodes.
+    #[test]
+    fn history_register_snapshot_is_frozen_per_entry() {
+        let mut em = EmcyProducer::new();
+        let mut od = od();
+        em.raise(&mut od, 0x2001, err_reg::GENERIC, [0; 5]).unwrap();
+        em.raise(&mut od, 0x2002, err_reg::COMMUNICATION, [0; 5])
+            .unwrap();
+        let word1 = match od.read(Address::new(0x1003, 2)).unwrap() {
+            Value::Uint(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        let word2 = match od.read(Address::new(0x1003, 1)).unwrap() {
+            Value::Uint(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        // First entry froze GENERIC only; the second saw the merged register.
+        assert_eq!(word1 >> 16, u64::from(err_reg::GENERIC));
+        assert_eq!(
+            word2 >> 16,
+            u64::from(err_reg::GENERIC | err_reg::COMMUNICATION)
+        );
+
+        // Clearing the second fault changes 0x1001 but not the stored words.
+        em.clear(&mut od, 0x2002).unwrap();
+        assert_eq!(
+            od.read(Address::new(0x1003, 1)).unwrap(),
+            Value::Uint(word2)
+        );
+        assert_eq!(
+            od.read(Address::new(0x1003, 2)).unwrap(),
+            Value::Uint(word1)
         );
     }
 
@@ -732,8 +859,13 @@ mod tests {
     fn describe_known_families() {
         assert_eq!(describe_code(0x0000), "error reset / no error");
         assert_eq!(describe_code(0x3000), "voltage");
-        // BUGS.md 十L3: aligned with CANopenNode `CO_Emergency.h`.
+        // docs/DESIGN-DECISIONS.md 十L3: aligned with CANopenNode `CO_Emergency.h`.
         assert_eq!(describe_code(0x8110), "CAN overrun (objects lost)");
+        assert_eq!(
+            describe_code(0x8100),
+            "communication",
+            "SYN-01 emits the CANopenNode generic communication code"
+        );
         assert_eq!(describe_code(0x8120), "CAN in error passive mode");
         assert_eq!(describe_code(0x8150), "CAN-ID collision");
         assert_eq!(
@@ -746,7 +878,7 @@ mod tests {
 
     #[test]
     fn active_table_is_bounded() {
-        // BUGS.md M5：`active` 此前完全无界——任一远端持续发送不同 EMCY 码
+        // docs/DESIGN-DECISIONS.md M5：`active` 此前完全无界——任一远端持续发送不同 EMCY 码
         // 即可无界追加。修复后超过 `ACTIVE_CAPACITY` 时丢弃最旧条目。
         let mut cons = EmcyConsumer::new(8);
         let node = NodeId::new(1).unwrap();
@@ -769,6 +901,36 @@ mod tests {
         let codes: Vec<u16> = cons.active().iter().map(|(_, c)| *c).collect();
         assert!(!codes.contains(&0x1000));
         assert!(codes.contains(&(0x1000 + ACTIVE_CAPACITY as u16 + 99)));
+    }
+
+    /// docs/DESIGN-DECISIONS.md 七F4a: the consumer treats the whole `0x00xx` reset family as
+    /// "error reset" like python-canopen (`code & 0xFF00 == 0`,
+    /// `emcy.py:33-35`), not just `0x0000`.
+    #[test]
+    fn consumer_reset_family_clears_active() {
+        let node = NodeId::new(1).unwrap();
+        let mut cons = EmcyConsumer::new(8);
+        cons.on_frame(
+            node,
+            EmcyFrame {
+                code: 0x8110,
+                register: 1,
+                data: [0; 5],
+            },
+        );
+        assert_eq!(cons.active().len(), 1);
+        cons.on_frame(
+            node,
+            EmcyFrame {
+                code: 0x0042,
+                register: 0,
+                data: [0; 5],
+            },
+        );
+        assert!(
+            cons.active().is_empty(),
+            "0x00xx belongs to the reset family and clears the node's table"
+        );
     }
 
     #[test]

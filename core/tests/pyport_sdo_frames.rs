@@ -7,7 +7,7 @@
 //! client emits, every RX entry is fed into it. Any divergence from the
 //! python-canopen wire behaviour fails here.
 //!
-//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! NOTE (docs/DESIGN-DECISIONS.md M9): the golden frames below are hand-transcribed from
 //! python-canopen's suite and are **not** re-checked by `cargo test` against
 //! `ref/`. After touching any codec, run
 //! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the
@@ -37,7 +37,7 @@ fn f(bytes: &[u8]) -> SdoPayload {
 /// client's pending queue, RX entries feed frames in. Returns the frames the
 /// client actually transmitted plus the value of the last `Complete` event
 /// (if any) — so golden-frame tests can also assert the *decoded* result,
-/// not just the wire bytes (`BUGS.md` TH3).
+/// not just the wire bytes (`docs/DESIGN-DECISIONS.md` TH3).
 fn run_script(
     client: &mut SdoClient,
     first_tx: Vec<SdoPayload>,
@@ -125,7 +125,7 @@ fn block_upload_golden_frames() {
         (Tx, f(&[0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])),
     ];
     let (_sent, value) = run_script(&mut client, first, &script);
-    // BUGS.md TH3: the golden frames were only ever compared byte-by-byte —
+    // docs/DESIGN-DECISIONS.md TH3: the golden frames were only ever compared byte-by-byte —
     // a value mis-decoded into the wrong string still passed. Assert the
     // *decoded* result surfaces through `Complete`.
     assert_eq!(
@@ -192,7 +192,7 @@ fn partial_ack_triggers_rewind_and_resend() {
     );
 }
 /// test_sdo.py:191 — zero-length segmented download. Formerly documented
-/// deviation D5 (API rejected empty payloads); since BUGS.md R10-P2-4 the
+/// deviation D5 (API rejected empty payloads); since docs/DESIGN-DECISIONS.md R10-P2-4 the
 /// client matches python-canopen exactly: `size=0` initiate followed by an
 /// empty final segment (`c=1`, no data). Full wire coverage lives in
 /// `zero_length_write_roundtrips_via_segmented`; this keeps the frame-shape

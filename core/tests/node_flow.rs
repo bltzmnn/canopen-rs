@@ -4,9 +4,9 @@
 
 use canopen_core::datatypes::{DataType, Value};
 use canopen_core::emcy::{err_reg, install_standard_objects};
-use canopen_core::node::{Node, TxFrame};
+use canopen_core::node::{CanStatus, NmtControl, Node, TxFrame};
 use canopen_core::object_dictionary::{AccessType, Entry, ObjectDictionary, Storage};
-use canopen_core::pdo::MappingEntry;
+use canopen_core::pdo::{MappingEntry, PdoConfigPolicy};
 use canopen_core::sdo::{SdoAbortCode, SdoClient, SdoEvent};
 use canopen_core::standard::StandardObjects;
 use canopen_core::types::{Address, Error, NodeId};
@@ -48,6 +48,7 @@ fn install_pdo_objects(od: &mut ObjectDictionary, tpdo_count: u16, rpdo_count: u
         put(od, Address::new(comm, 2), 254, DataType::Unsigned8);
         put(od, Address::new(comm, 3), 0, DataType::Unsigned16);
         put(od, Address::new(comm, 5), 0, DataType::Unsigned16);
+        put(od, Address::new(comm, 6), 0, DataType::Unsigned8);
         put(od, Address::new(map, 0), 0, DataType::Unsigned8);
         for sub in 1..=8u16 {
             put(od, Address::new(map, sub as u8), 0, DataType::Unsigned32);
@@ -96,7 +97,10 @@ fn transact(node: &mut Node, client: &mut SdoClient, first: Vec<[u8; 8]>) -> Opt
     let mut completed = None;
     while let Some(frame) = queue.pop_front() {
         for resp in node.on_frame(0x600 + u16::from(NODE), &frame) {
-            match client.on_response(&resp.data).expect("valid response") {
+            match client
+                .on_response(&resp.data)
+                .unwrap_or_else(|e| panic!("valid response for {frame:02x?}: {e}"))
+            {
                 SdoEvent::Send(frames) => queue.extend(frames),
                 SdoEvent::Complete(value, trailing) => {
                     completed = Some(value);
@@ -115,6 +119,20 @@ fn sdo_write_u32(node: &mut Node, addr: Address, value: u32) {
 
 fn sdo_write_u16(node: &mut Node, addr: Address, value: u16) {
     sdo_write_raw(node, addr, &value.to_le_bytes());
+}
+
+/// Asserts that an expedited SDO write is **refused** (abort frame).
+fn expect_abort(node: &mut Node, addr: Address, raw: &[u8]) {
+    let mut client = SdoClient::new();
+    let first = client.write(addr, raw).expect("client builds the request");
+    let out = node.on_frame(0x600 + u16::from(NODE), &first[0]);
+    assert_eq!(out.len(), 1, "the server must answer the request");
+    assert_eq!(
+        out[0].payload()[0] & 0xE0,
+        0x80,
+        "expected an abort frame for {addr:?} = {raw:02x?}, got {:02x?}",
+        out[0].payload()
+    );
 }
 
 fn sdo_write_u8(node: &mut Node, addr: Address, value: u8) {
@@ -152,7 +170,7 @@ fn bootup_frame_and_nmt_lifecycle() {
     assert_eq!(node.nmt_state(), canopen_core::nmt::NmtState::Stopped);
 
     // Reset communication: the node re-enters Initialising and immediately
-    // re-boots (BUGS.md H2) — the reset hand-back IS the boot-up frame and
+    // re-boots (docs/DESIGN-DECISIONS.md H2) — the reset hand-back IS the boot-up frame and
     // the node returns to PreOperational, so a master can start it again.
     let reset_out = node.on_frame(0x000, &[0x82, 0x00]);
     assert_eq!(reset_out.len(), 1, "reset re-boots the node");
@@ -177,7 +195,11 @@ fn sdo_configures_pdos_and_data_flows_end_to_end() {
     // --- Configure TPDO1 via SDO (live reconfiguration path) ---------------
     // COB-ID valid = default TPDO1 for node 5; transmission type = SYNC every
     // 2nd sync; mapping = 0x6000:01 (8 bits) + 0x6000:02 (16 bits).
-    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    //
+    // docs/DESIGN-DECISIONS.md PDO-03: the reference refuses a COB-ID *change* while the PDO is
+    // enabled and refuses inhibit/start-value writes outright, so a master
+    // must fill the record first and enable (sub 1) **last** — the order
+    // CiA 301 tooling and CANopenNode's own guards imply.
     sdo_write_u8(&mut node, Address::new(0x1800, 2), 2);
     sdo_write_u8(&mut node, Address::new(0x1A00, 0), 2);
     sdo_write_u32(
@@ -198,9 +220,9 @@ fn sdo_configures_pdos_and_data_flows_end_to_end() {
         }
         .to_u32(),
     );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185); // enable last
 
     // --- Configure RPDO1 ----------------------------------------------------
-    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
     sdo_write_u8(&mut node, Address::new(0x1400, 2), 254);
     sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
     sdo_write_u32(
@@ -212,6 +234,7 @@ fn sdo_configures_pdos_and_data_flows_end_to_end() {
         }
         .to_u32(),
     );
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205); // enable last (PDO-03)
 
     // Not started yet: RPDO frames are ignored in PreOperational.
     let _ = node.on_frame(0x205, &[0x99, 0x98]);
@@ -254,9 +277,11 @@ fn sdo_configures_pdos_and_data_flows_end_to_end() {
 
     // --- Event-driven TPDO via request + poll --------------------------------
     // Reconfigure TPDO2 as event-driven with inhibit = 100 x 100 µs = 10 ms...
-    sdo_write_u32(&mut node, Address::new(0x1801, 1), 0x285);
+    // PDO-03: the inhibit time (sub 3) may only be written while the PDO is
+    // disabled, so the record is filled first and enabled last.
     sdo_write_u8(&mut node, Address::new(0x1801, 2), 254);
     sdo_write_u16(&mut node, Address::new(0x1801, 3), 100); // 100 * 100 µs = 10 ms
+    sdo_write_u32(&mut node, Address::new(0x1801, 1), 0x285);
     sdo_write_u8(&mut node, Address::new(0x1A01, 0), 1);
     sdo_write_u32(
         &mut node,
@@ -295,18 +320,335 @@ fn sdo_configures_pdos_and_data_flows_end_to_end() {
     assert_eq!(frames.len(), 1);
 }
 
+/// docs/DESIGN-DECISIONS.md PDO-23: a mapping sub-entry whose bit length can never be
+/// assembled (>64 bits in one entry, or pushing the running total past 64)
+/// aborts with `MappingLengthExceeded` (0x0604_0042) at the SDO write
+/// instead of being confirmed and silently removing the slot at re-assembly.
+#[test]
+fn sdo_write_of_unassemblable_mapping_entry_aborts() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Three entries declared; entries 1+2 consume all 64 available bits.
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 3);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 32,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 2),
+        MappingEntry {
+            address: Address::new(0x6000, 2),
+            bit_length: 32,
+        }
+        .to_u32(),
+    );
+    let mut client = SdoClient::new();
+
+    // 32 + 32 + 8 exceeds the 64-bit payload → abort, value not stored.
+    let first = client
+        .write(
+            Address::new(0x1600, 3),
+            &MappingEntry {
+                address: Address::new(0x6000, 3),
+                bit_length: 8,
+            }
+            .to_u32()
+            .to_le_bytes(),
+        )
+        .unwrap();
+    let code = transact_expect_abort(&mut node, &mut client, first);
+    assert_eq!(code, SdoAbortCode::MappingLengthExceeded);
+    assert_eq!(od_value(&node, Address::new(0x1600, 3)), 0);
+
+    // A single entry above 64 bits is rejected outright (`from_u32`):
+    // 0x6000:1 with bit_length 0x41 = 65.
+    let first = client
+        .write(Address::new(0x1600, 1), &0x6000_0141u32.to_le_bytes())
+        .unwrap();
+    let code = transact_expect_abort(&mut node, &mut client, first);
+    assert_eq!(code, SdoAbortCode::MappingLengthExceeded);
+    // The rejected value never landed in the OD.
+    assert_eq!(
+        od_value(&node, Address::new(0x1600, 1)),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 32,
+        }
+        .to_u32() as u64
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md 审-P5: a mapping sub0 write above 64 entries aborts with
+/// `MappingLengthExceeded` (0x0604_0042) — CANopenNode's `ODR_MAP_LEN`
+/// (`CO_PDO.c:231-237`) — instead of succeeding and being silently clamped
+/// during assembly.
+#[test]
+fn sdo_write_of_oversized_mapping_count_aborts() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    let mut client = SdoClient::new();
+    let first = client.write(Address::new(0x1A00, 0), &[65]).unwrap();
+    let mut queue: std::collections::VecDeque<[u8; 8]> = first.into();
+    let mut abort: Option<[u8; 8]> = None;
+    while let Some(frame) = queue.pop_front() {
+        for resp in node.on_frame(0x600 + u16::from(NODE), &frame) {
+            if resp.data[0] == 0x80 {
+                abort = Some(resp.data);
+            } else if let Ok(SdoEvent::Send(frames)) = client.on_response(&resp.data) {
+                queue.extend(frames);
+            }
+        }
+    }
+    let abort = abort.expect("a write of 65 mapping entries must abort");
+    assert_eq!(
+        u16::from_le_bytes([abort[1], abort[2]]),
+        0x1A00,
+        "the abort names the written record"
+    );
+    assert_eq!(
+        u32::from_le_bytes([abort[4], abort[5], abort[6], abort[7]]),
+        0x0604_0042,
+        "ODR_MAP_LEN maps onto MappingLengthExceeded"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md 审-P1: writing one PDO's parameters must rebuild only that slot —
+/// an unrelated TPDO's already-latched event must survive. CANopenNode's
+/// `OD_write_14xx/16xx/18xx/1Axx` handlers touch a single PDO instance
+/// (`CO_PDO.c:487-676,876-1020`); the previous full rebuild cleared every
+/// other slot's runtime state.
+#[test]
+fn pdo_write_preserves_unrelated_slots_runtime_state() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // TPDO1: event driven, no event timer, mapped to 0x6000:1.
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254);
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    // RPDO1: mapped so a write to its records rebuilds a real slot.
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 254);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 2),
+            bit_length: 16,
+        }
+        .to_u32(),
+    );
+    start_node(&mut node);
+    // Drain the initial event latched on entering Operational.
+    let initial: Vec<TxFrame> = node
+        .poll(1000)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x185)
+        .collect();
+    assert_eq!(initial.len(), 1);
+
+    // Latch a fresh TPDO1 event, then write an RPDO1 parameter through SDO.
+    assert!(node.request_tpdo(1));
+    sdo_write_u16(&mut node, Address::new(0x1400, 5), 100); // RPDO1 event timer
+    let frames: Vec<TxFrame> = node
+        .poll(1100)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x185)
+        .collect();
+    assert_eq!(
+        frames.len(),
+        1,
+        "an unrelated PDO write must not cancel the latched TPDO event"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md 审-P3: leaving Operational resets the TPDO timers, so the initial
+/// event after a Stop→Start cycle is not delayed by a pre-stop inhibit window
+/// (CANopenNode `CO_PDO.c:1343-1349` resets `inhibitTimer`/`eventTimer` and
+/// requests a fresh transmission while not operational).
+#[test]
+fn leaving_operational_resets_tpdo_inhibit_timer() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254);
+    sdo_write_u16(&mut node, Address::new(0x1800, 3), 100); // 100 × 100 µs = 10 ms inhibit
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185); // enable last (PDO-03)
+    start_node(&mut node);
+    let first: Vec<TxFrame> = node
+        .poll(1000)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x185)
+        .collect();
+    assert_eq!(first.len(), 1, "initial event");
+    assert_eq!(first[0].payload(), &[0x00]);
+
+    // Stop and restart 3 ms later — inside the 10 ms inhibit window.
+    let _ = node.on_frame(0x000, &[0x02, 0x00]);
+    let _ = node.on_frame(0x000, &[0x01, 0x00]);
+    let again: Vec<TxFrame> = node
+        .poll(1003)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x185)
+        .collect();
+    assert_eq!(
+        again.len(),
+        1,
+        "the re-entry event must not wait out the pre-stop inhibit window"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md 审-N1: a monitored node timing out reports EMCY 0x8130, and the
+/// condition clears when every monitored node is active again
+/// (CANopenNode `CO_HBconsumer.c:353-367,423-428`; single shared error bit,
+/// `CO_Emergency.c:658-663`).
+#[test]
+fn heartbeat_consumer_timeout_reports_and_clears_emcy() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Supervise node 7 with a 30 ms timeout.
+    sdo_write_u32(&mut node, Address::new(0x1016, 1), (7 << 16) | 30);
+    start_node(&mut node);
+    let _ = node.on_frame(0x707, &[0x05]);
+    node.poll(10);
+
+    // Silence past the deadline → EMCY 0x8130 from node 5.
+    let emcy: Vec<TxFrame> = node
+        .poll(500)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x85)
+        .collect();
+    assert_eq!(emcy.len(), 1, "lost consumer must report an EMCY");
+    assert_eq!(&emcy[0].payload()[..2], &[0x30, 0x81], "code 0x8130");
+    // docs/DESIGN-DECISIONS.md EMC-16: the manufacturer field follows the reference layout
+    // `[errorBit, infoLE(4)]` — CANopenNode passes
+    // `CO_EM_HEARTBEAT_CONSUMER` (0x1B, `CO_Emergency.h:209`) and the
+    // monitoring-table index `i` (`CO_HBconsumer.c:364`).
+    assert_eq!(
+        emcy[0].data[3], 0x1B,
+        "byte 3 carries CO_EM_HEARTBEAT_CONSUMER"
+    );
+    assert_eq!(
+        &emcy[0].data[4..],
+        &0u32.to_le_bytes(),
+        "infoCode is the 0-based monitoring-table index (node 7 is the only entry)"
+    );
+
+    // Recovery: every monitored node active → clear frame (code 0x0000).
+    let _ = node.on_frame(0x707, &[0x05]);
+    let clear: Vec<TxFrame> = node
+        .poll(520)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x85)
+        .collect();
+    assert_eq!(clear.len(), 1, "full recovery must clear the condition");
+    assert_eq!(&clear[0].payload()[..2], &[0x00, 0x00]);
+}
+
+/// docs/DESIGN-DECISIONS.md EMC-16: the 0x8130 infoCode names *which* 0x1016 entry timed out —
+/// the monitoring-table index, exactly like CANopenLinux's loop counter `i`
+/// in `CO_HBconsumer_process` (`CO_HBconsumer.c:364`).
+#[test]
+fn heartbeat_consumer_emcy_info_identifies_the_entry() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Two entries; node 8 sits at index 1 (entries are ordered by node id).
+    sdo_write_u32(&mut node, Address::new(0x1016, 1), (7 << 16) | 30);
+    sdo_write_u32(&mut node, Address::new(0x1016, 2), (8 << 16) | 30);
+    start_node(&mut node);
+    // Only node 7 ever reports; node 8 stays UNKNOWN and never times out.
+    let _ = node.on_frame(0x707, &[0x05]);
+    node.poll(10);
+
+    let emcy: Vec<TxFrame> = node
+        .poll(500)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x85)
+        .collect();
+    assert_eq!(emcy.len(), 1, "only node 7 timed out: {emcy:?}");
+    assert_eq!(emcy[0].data[3], 0x1B);
+    assert_eq!(
+        u32::from_le_bytes([
+            emcy[0].data[4],
+            emcy[0].data[5],
+            emcy[0].data[6],
+            emcy[0].data[7]
+        ]),
+        0,
+        "node 7 is the first monitoring entry"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md 审-N2: while the heartbeat producer is active, node guarding is
+/// disabled and its toggle is forced to the base state; disabling 0x1017
+/// resumes guarding at toggle 0 (CANopenNode `CO_Node_Guarding.c:178-183`,
+/// `slaveDisable = HBproducerTime > 0`).
+#[test]
+fn heartbeat_producer_resets_guarding_toggle() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    start_node(&mut node);
+    // First guard answer carries toggle 0, the next one toggle 1.
+    let first = node.on_remote_request(0x705).expect("guarding answer");
+    assert_eq!(first.payload()[0] & 0x80, 0, "first answer: toggle 0");
+    let second = node.on_remote_request(0x705).expect("second answer");
+    assert_eq!(second.payload()[0] & 0x80, 0x80, "second answer: toggle 1");
+
+    // Enable the heartbeat producer: guarding is disabled, and the next poll
+    // tick forces the toggle low.
+    sdo_write_u16(&mut node, Address::new(0x1017, 0), 100);
+    assert!(
+        node.on_remote_request(0x705).is_none(),
+        "heartbeat enable disables guarding"
+    );
+    node.poll(10);
+
+    // Disable heartbeat: guarding resumes at the base toggle.
+    sdo_write_u16(&mut node, Address::new(0x1017, 0), 0);
+    let resumed = node.on_remote_request(0x705).expect("guarding resumes");
+    assert_eq!(
+        resumed.payload()[0] & 0x80,
+        0,
+        "guarding must resume from toggle 0, not a stale value"
+    );
+}
+
 #[test]
 fn heartbeat_is_produced_on_schedule() {
     let mut node = test_node();
     // Preload 0x1017 = 50 ms (UNSIGNED16) like an EDS default, so this test
-    // covers the boot-up anchor (BUGS.md L4) without the write-triggered
-    // immediate frame of BUGS.md B4.
+    // covers the boot-up anchor (docs/DESIGN-DECISIONS.md L4) without the write-triggered
+    // immediate frame of docs/DESIGN-DECISIONS.md B4.
     node.od_mut()
         .set_value(Address::new(0x1017, 0), Value::Uint(50))
         .unwrap();
     node.boot().unwrap();
 
-    // BUGS.md L4: the boot-up frame itself is the first heartbeat (0x00),
+    // docs/DESIGN-DECISIONS.md L4: the boot-up frame itself is the first heartbeat (0x00),
     // so the periodic producer does not fire an immediate second frame —
     // the first periodic heartbeat lands only after one full period.
     assert!(!node.poll(0).iter().any(|f| f.cob_id == 0x705));
@@ -335,7 +677,7 @@ fn heartbeat_is_produced_on_schedule() {
     assert!(!node.poll(10_000).iter().any(|f| f.cob_id == 0x705));
 }
 
-/// BUGS.md B4: writing 0x1017 restarts the producer and emits one heartbeat
+/// docs/DESIGN-DECISIONS.md B4: writing 0x1017 restarts the producer and emits one heartbeat
 /// at the next poll (CANopenNode `CO_NMT_Heartbeat.c:64-66,187-189`).
 #[test]
 fn writing_producer_heartbeat_time_sends_immediately() {
@@ -369,7 +711,7 @@ fn guarding_rtr_poll_alternates_toggle() {
     assert_eq!(r3.payload(), &[0x7F]);
 }
 
-/// BUGS.md L1: the node-guarding toggle resets to 0 on *every* NMT state
+/// docs/DESIGN-DECISIONS.md L1: the node-guarding toggle resets to 0 on *every* NMT state
 /// change (CiA 301 §7.3.1), not only on resets — a master polling across a
 /// Stop/Start cycle must see the toggle restart, not a stale value that
 /// would look like a missed toggle.
@@ -379,7 +721,7 @@ fn guarding_toggle_keeps_alternating_across_nmt_transition() {
     node.boot().unwrap();
     // First response carries toggle 0 and arms the toggle at 1.
     assert_eq!(node.on_remote_request(0x705).unwrap().payload(), &[0x7F]);
-    // BUGS.md B5: an NMT Stop must *not* reset the toggle — the reference
+    // docs/DESIGN-DECISIONS.md B5: an NMT Stop must *not* reset the toggle — the reference
     // master enforces strict alternation (`CO_Node_Guarding.c:255-259`), so
     // the next response still carries the toggled bit (old behavior reset it
     // to 0 here, which a real master reads as a lost toggle).
@@ -389,7 +731,7 @@ fn guarding_toggle_keeps_alternating_across_nmt_transition() {
     assert_eq!(node.on_remote_request(0x705).unwrap().payload(), &[0x04]);
 }
 
-/// BUGS.md B3: node guarding and heartbeat are mutually exclusive; once the
+/// docs/DESIGN-DECISIONS.md B3: node guarding and heartbeat are mutually exclusive; once the
 /// heartbeat producer is enabled (0x1017 > 0) an RTR is not answered.
 #[test]
 fn guarding_disabled_while_heartbeat_enabled() {
@@ -443,7 +785,7 @@ fn lss_address() -> LssAddress {
     }
 }
 
-/// BUGS.md 八L17: an unconfigured node (CiA 305, LSS only) must not emit a
+/// docs/DESIGN-DECISIONS.md 八L17: an unconfigured node (CiA 305, LSS only) must not emit a
 /// boot-up frame on the placeholder node-1 heartbeat COB.
 #[test]
 fn unconfigured_node_does_not_boot_up() {
@@ -454,12 +796,413 @@ fn unconfigured_node_does_not_boot_up() {
     );
 }
 
-/// BUGS.md 八L15: the TIME receive queue is bounded — a chatty 0x100
+/// docs/DESIGN-DECISIONS.md OD-03: DS-301 declares `PDOMapping=1` for 0x1001, so mapping the
+/// error register into a TPDO must assemble — before this the slot silently
+/// disappeared into the config-error ring (`PdoMapping::validate_against`
+/// rejects non-mappable targets).
+#[test]
+fn error_register_can_be_mapped_into_a_tpdo() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254);
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x1001, 0),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    start_node(&mut node);
+    let errs: Vec<_> = node.take_config_errors().collect();
+    assert!(errs.is_empty(), "the slot must assemble: {errs:?}");
+
+    // An emergency raises the error register and the mapped TPDO carries it.
+    let _ = node.raise_emergency(
+        0x8210,
+        canopen_core::emcy::err_reg::COMMUNICATION,
+        [0, 0, 0, 0, 0],
+    );
+    let _ = node.on_frame(0x185, &[0x01]); // application-style trigger
+    let frames = node.poll(10);
+    let tpdo = frames
+        .iter()
+        .find(|f| f.cob_id == 0x185)
+        .expect("mapped TPDO must be produced");
+    // CiA 301 error register bit 4 = "communication error" (0x8210 lands
+    // there), carried by the mapped TPDO byte.
+    assert_eq!(tpdo.payload()[0], 0x10, "error register bit 4 set");
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-03 ② / GTW-27: the inhibit-time write gate is **TPDO-only**.
+/// `OD_write_14xx` has no case 3 (the RPDO record's event timer is sub 5) and
+/// DS-301's `[1400]` has no sub 3, so writing `0x1400:3` while the RPDO is
+/// enabled must be accepted — this stack never consumes that field on the
+/// receive path either.
+#[test]
+fn rpdo_sub3_write_is_not_gated_like_tpdo_inhibit_time() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Configure and enable RPDO1 while disabled (docs/DESIGN-DECISIONS.md PDO-03 ①).
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x8000_0000 | 0x205);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
+    // sub 3 of the RPDO record: no reference gate, so no abort.
+    sdo_write_u16(&mut node, Address::new(0x1400, 3), 100);
+    assert_eq!(od_value(&node, Address::new(0x1400, 3)), 100);
+
+    // The TPDO's real inhibit time (sub 3) **is** gated while enabled.
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x8000_0000 | 0x185);
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    expect_abort(&mut node, Address::new(0x1800, 3), &[0x64, 0x00]);
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-27: `ever_sent` is per-Operational-session, like the reference's
+/// `TPDO->syncCounter = 255` re-seed (`CO_PDO.c:1351`). A sync-start TPDO that
+/// already transmitted must wait for the start value again after Stop→Start.
+#[test]
+fn sync_start_wait_is_rearmed_after_a_stop_start_cycle() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 1); // SyncCyclic every SYNC
+    sdo_write_u8(&mut node, Address::new(0x1800, 6), 3); // start value 3
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    sdo_write_u8(&mut node, Address::new(0x1019, 0), 4);
+    let _ = node.on_frame(0x000, &[0x01, 0x00]); // Start
+
+    // Seed with the matching counter.
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[3]);
+    assert_eq!(out.iter().filter(|f| f.cob_id == 0x185).count(), 1);
+
+    // Stop → Start. The next counted SYNC does not match the start value, so
+    // the slot must wait again (the reference re-seeds per session).
+    let _ = node.on_frame(0x000, &[0x02, 0x00]);
+    let _ = node.on_frame(0x000, &[0x01, 0x00]);
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[5]);
+    assert_eq!(
+        out.iter().filter(|f| f.cob_id == 0x185).count(),
+        0,
+        "the SYNC start value is re-armed per Operational session: {out:?}"
+    );
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[3]);
+    assert_eq!(out.iter().filter(|f| f.cob_id == 0x185).count(), 1);
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-28: a timer-only rewrite (sub 5, allowed while running) must not
+/// push an already-transmitting sync-start TPDO back into the start-value wait
+/// — the silence PDO-26 was fixed for.
+#[test]
+fn timer_only_rewrite_keeps_the_sync_start_seeded() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 1);
+    sdo_write_u8(&mut node, Address::new(0x1800, 6), 3);
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    sdo_write_u8(&mut node, Address::new(0x1019, 0), 4);
+    let _ = node.on_frame(0x000, &[0x01, 0x00]);
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[3]);
+    assert_eq!(out.iter().filter(|f| f.cob_id == 0x185).count(), 1);
+
+    // Event timer only (sub 5 is writable while running).
+    sdo_write_u16(&mut node, Address::new(0x1800, 5), 250);
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[4]);
+    assert_eq!(
+        out.iter().filter(|f| f.cob_id == 0x185).count(),
+        1,
+        "a timer-only rewrite must not re-arm the start-value wait: {out:?}"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md NMT-15: writing **one** 0x1016 sub must not reset the supervision
+/// state of the other monitored nodes — CANopenNode re-inits only the written
+/// entry (`CO_HBconsumer.c:93-94`).
+#[test]
+fn unrelated_0x1016_write_keeps_other_entries_supervised() {
+    use canopen_core::nmt::HbEvent;
+    let mut node = test_node();
+    node.boot().unwrap();
+    let word = |node_id: u8, ms: u16| (u32::from(node_id) << 16) | u32::from(ms);
+    sdo_write_u32(&mut node, Address::new(0x1016, 1), word(0x09, 100));
+    sdo_write_u32(&mut node, Address::new(0x1016, 2), word(0x0A, 100));
+    let _ = node.on_frame(0x000, &[0x01, 0x00]);
+    for id in 0x709..=0x70A {
+        let _ = node.on_frame(id, &[0x05]);
+    }
+    let _ = node.poll(10);
+
+    // Add a third consumer: node 9's entry is untouched by the write.
+    sdo_write_u32(&mut node, Address::new(0x1016, 3), word(0x0B, 100));
+    // Node 9 goes silent while 10 keeps heartbeating.
+    for _ in 0..40 {
+        let _ = node.on_frame(0x70A, &[0x05]);
+    }
+    let _ = node.poll(10_000);
+    let lost: Vec<u32> = node
+        .take_hb_events()
+        .iter()
+        .filter_map(|e| match e {
+            HbEvent::Lost { node } => Some(u32::from(node.get())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lost, vec![9], "the unwritten entry must still report Lost");
+}
+
+/// docs/DESIGN-DECISIONS.md OD-01/OD-02: the DS-301 communication area is present in full —
+/// 0x1280 is a three-entry `rw` record (sub0 = 3) and 0x100A sits next to
+/// 0x1008/0x1009 — and both 0x1280 COB-ID pairs follow `set_node_id`.
+#[test]
+fn sdo_client_record_is_ds301_shaped_and_follows_the_node_id() {
+    let mut node = Node::new(NodeId::new(NODE).unwrap(), test_od_dict()).unwrap();
+    node.boot().unwrap();
+    assert_eq!(od_value(&node, Address::new(0x1280, 0)), 3, "SubNumber = 3");
+    // The baseline pre-loads the node-1 placeholders 0x601/0x581, which
+    // `Node::new` immediately re-points at this node (docs/DESIGN-DECISIONS.md P2-2 / OD-01).
+    assert_eq!(
+        od_value(&node, Address::new(0x1280, 1)),
+        u64::from(0x600 + u16::from(NODE))
+    );
+    assert_eq!(
+        od_value(&node, Address::new(0x1280, 2)),
+        u64::from(0x580 + u16::from(NODE))
+    );
+    // OD-02: the third standard communication string.
+    assert!(node.od().entry(Address::new(0x100A, 0)).is_some());
+
+    // Both subentries are writable (a master may configure its own client).
+    sdo_write_u32(&mut node, Address::new(0x1280, 2), 0x5A5);
+    assert_eq!(od_value(&node, Address::new(0x1280, 2)), 0x5A5);
+    // A custom value survives the renumbering (shape-guarded rewrite).
+    node.set_node_id(NodeId::new(9).unwrap());
+    assert_eq!(od_value(&node, Address::new(0x1280, 2)), 0x5A5);
+    assert_eq!(od_value(&node, Address::new(0x1280, 1)), 0x609);
+
+    // …while the predefined value follows the new node segment.
+    let mut node2 = Node::new(NodeId::new(NODE).unwrap(), test_od_dict()).unwrap();
+    node2.boot().unwrap();
+    node2.set_node_id(NodeId::new(9).unwrap());
+    assert_eq!(od_value(&node2, Address::new(0x1280, 1)), 0x609);
+    assert_eq!(od_value(&node2, Address::new(0x1280, 2)), 0x589);
+}
+
+/// docs/DESIGN-DECISIONS.md NMT-14: a `Start` that races application start-up (received while
+/// the node is still Initialising) must be applied — CiA 301 wants the command
+/// honoured, and CANopenNode's `switch (NMT->internalCommand)` has no state gate
+/// (`CO_NMT_Heartbeat.c:207-220`), python assigns `self._state` outright
+/// (`nmt.py:57-66`).
+#[test]
+fn start_during_initialising_is_applied() {
+    let mut node = test_node();
+    // No boot() yet: the node is Initialising, exactly the window between
+    // `Node::new` and the application's first `boot()`.
+    assert_eq!(node.nmt_state(), canopen_core::nmt::NmtState::Initialising);
+    let out = node.on_frame(0x000, &[0x01, 0x00]); // Start remote node
+    assert_eq!(
+        node.nmt_state(),
+        canopen_core::nmt::NmtState::Operational,
+        "Start must be honoured while Initialising"
+    );
+    let _ = out; // the state-change heartbeat is an `on_frame` nicety, not the point here
+
+    // Stop behaves as before, and a reset still wins — re-booting the node
+    // through the usual `communication_reset() → boot()` chain.
+    let _ = node.on_frame(0x000, &[0x02, 0x00]);
+    assert_eq!(node.nmt_state(), canopen_core::nmt::NmtState::Stopped);
+    let _ = node.on_frame(0x000, &[0x82, 0x00]);
+    assert_eq!(
+        node.nmt_state(),
+        canopen_core::nmt::NmtState::PreOperational
+    );
+    let _ = node.on_frame(0x000, &[0x80, 0x00]);
+    assert_eq!(
+        node.nmt_state(),
+        canopen_core::nmt::NmtState::PreOperational
+    );
+    let _ = node.on_frame(0x000, &[0x01, 0x00]);
+    assert_eq!(node.nmt_state(), canopen_core::nmt::NmtState::Operational);
+}
+
+/// docs/DESIGN-DECISIONS.md SYN-11: `OD_write_1005` refuses a COB-ID change while the SYNC
+/// producer is already enabled (`(SYNC->isProducer && isProducer && (CAN_ID !=
+/// SYNC->CAN_ID))`, `CO_SYNC.c:86-91`) — the same rule the 0x1014 branch of
+/// this guard already implements.
+#[test]
+fn sync_cob_id_change_while_producer_enabled_aborts() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Declare ourselves the SYNC producer at 0x80 (bit30 set).
+    sdo_write_u32(&mut node, Address::new(0x1005, 0), 0x4000_0080);
+    // Changing the identifier while the producer flag stays set → abort
+    // 0x0609_0030.
+    expect_abort(
+        &mut node,
+        Address::new(0x1005, 0),
+        &[0x81, 0x00, 0x40, 0x00],
+    );
+    // 0x1005 has **no** "disabled" bit (bit31 is rejected outright), so
+    // dropping the producer flag is what releases the identifier.
+    sdo_write_u32(&mut node, Address::new(0x1005, 0), 0x80);
+    sdo_write_u32(&mut node, Address::new(0x1005, 0), 0x4000_0081);
+    assert_eq!(od_value(&node, Address::new(0x1005, 0)), 0x4000_0081);
+    // And once the producer flag is set again the identifier is pinned.
+    expect_abort(
+        &mut node,
+        Address::new(0x1005, 0),
+        &[0x82, 0x00, 0x40, 0x00],
+    );
+    // A plain consumer (bit30 clear) may move its identifier freely.
+    sdo_write_u32(&mut node, Address::new(0x1005, 0), 0x82);
+    sdo_write_u32(&mut node, Address::new(0x1005, 0), 0x83);
+    assert_eq!(od_value(&node, Address::new(0x1005, 0)), 0x83);
+}
+
+/// docs/DESIGN-DECISIONS.md SYN-09 ①②: the TIME consumer is gated on (Pre)Operational — the
+/// reference clears the latch in every other state (`CO_TIME.c:155-172`) —
+/// and yields to a configured RPDO claiming 0x100, mirroring the heartbeat and
+/// EMCY interceptions in the same function.
+#[test]
+fn time_consumer_respects_nmt_state_and_rpdo_claim() {
+    let mut node = test_node();
+    // docs/DESIGN-DECISIONS.md SYN-10: the standard default (0x1012 = 0x100) has the
+    // consumer bit clear; enable it before expecting TIME consumption.
+    node.od_mut()
+        .set_value(Address::new(0x1012, 0), Value::Uint(0x8000_0100))
+        .unwrap();
+    // Initialising: a TIME frame is dropped, not queued.
+    let _ = node.on_frame(0x100, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+    assert!(
+        node.take_time_events().is_empty(),
+        "TIME is consumed in (Pre)Operational only"
+    );
+    node.boot().unwrap();
+    let _ = node.on_frame(0x100, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+    assert_eq!(node.take_time_events().len(), 1, "queued in PreOperational");
+
+    // A configured RPDO on 0x100 wins: the payload is PDO data, not a stamp.
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x8000_0000 | 0x100);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 254);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_raw(&mut node, Address::new(0x6000, 1), &[0]);
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x100);
+    start_node(&mut node);
+    let _ = node.on_frame(0x100, &[0x77, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    assert!(
+        node.take_time_events().is_empty(),
+        "an RPDO claiming 0x100 keeps the frame"
+    );
+    assert_eq!(
+        od_value(&node, Address::new(0x6000, 1)),
+        0x77,
+        "the 6-byte payload was applied as PDO data"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md NMT-13: reconfiguring a consumer timeout must reset the entry's
+/// supervision state, like CANopenNode's `OD_write_1016` →
+/// `CO_HBconsumer_initEntry` (`CO_HBconsumer.c:76-101,168-216`, which clears
+/// `CANrxNew` and puts the NMT/heartbeat state back to UNKNOWN). Keeping the
+/// pre-write silence let a shrinking timeout fire a false `Lost` immediately.
+#[test]
+fn consumer_timeout_reconfiguration_resets_supervision_state() {
+    use canopen_core::nmt::{HbEvent, HeartbeatConsumer};
+    let mut hb = HeartbeatConsumer::new();
+    let n9 = NodeId::new(9).unwrap();
+    hb.set_timeout(n9, 100);
+    // Heartbeat at t=0, then silence; the entry is inside its 100 ms window.
+    let _ = hb.on_heartbeat(n9, &[0x05], 0);
+    assert!(hb.poll(50).is_empty(), "inside the 100 ms window");
+
+    // Shrink the timeout to 10 ms at t=50: the pre-write stamp must not be
+    // charged against the new deadline.
+    hb.set_timeout(n9, 10);
+    let events = hb.poll(60);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, HbEvent::Lost { node, .. } if *node == n9)),
+        "no false Lost right after a reconfiguration: {events:?}"
+    );
+    // Like the reference, the entry only times out once it is **active**:
+    // `CO_HBconsumer_initEntry` leaves `HBstate = UNKNOWN` and the timeout
+    // branch requires `HBstate == CO_HBconsumer_ACTIVE` (`CO_HBconsumer.c:353`),
+    // so no amount of silence before the next heartbeat reports `Lost`.
+    assert!(
+        hb.poll(5_000).is_empty(),
+        "an unknown entry cannot time out"
+    );
+    // The next heartbeat arms the reconfigured deadline, and the silence after
+    // it is what expires.
+    let _ = hb.on_heartbeat(n9, &[0x05], 5_100);
+    assert!(hb.poll(5_105).is_empty(), "10 ms window still open");
+    let events = hb.poll(5_400);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, HbEvent::Lost { node, .. } if *node == n9)),
+        "the reconfigured deadline applies once re-armed: {events:?}"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md 八L15: the TIME receive queue is bounded — a chatty 0x100
 /// producer while the application never drains must not grow memory
 /// without bound; the oldest frames get dropped.
 #[test]
 fn time_rx_queue_is_bounded() {
     let mut node = test_node();
+    node.od_mut()
+        .set_value(Address::new(0x1012, 0), Value::Uint(0x8000_0100))
+        .unwrap();
     node.boot().unwrap();
     for i in 0..400u32 {
         let mut f = [0u8; 6];
@@ -505,11 +1248,16 @@ fn lss_unconfigured_lifecycle() {
     // Reset path adopts the pending id; the node becomes fully functional.
     let new_id = node.apply_lss_node_id().unwrap();
     assert_eq!(new_id.get(), 0x21);
-    // BUGS.md P2-2 (see git history): 0x1280:1 must follow the new node segment on
+    // docs/DESIGN-DECISIONS.md P2-2 (see git history): 0x1280:1 must follow the new node segment on
     // the LSS adoption path too (previously only set_node_id did).
     assert_eq!(
         od_value(&node, Address::new(0x1280, 1)),
         u64::from(0x600u16 + u16::from(new_id.get()))
+    );
+    // docs/DESIGN-DECISIONS.md OD-01: sub2 (server→client, base 0x580) follows as well.
+    assert_eq!(
+        od_value(&node, Address::new(0x1280, 2)),
+        u64::from(0x580u16 + u16::from(new_id.get()))
     );
     node.boot().unwrap();
 
@@ -521,7 +1269,7 @@ fn lss_unconfigured_lifecycle() {
     assert_eq!(responses[0].cob_id, 0x580 + u16::from(new_id.get()));
 }
 
-/// BUGS.md 十M22: switching a configured-but-not-adopted node back to
+/// docs/DESIGN-DECISIONS.md 十M22: switching a configured-but-not-adopted node back to
 /// Waiting must autonomously run an NMT communication reset and adopt the
 /// pending id (CANopenNode `CO_LSSslave.c:56-66,275-280`).
 #[test]
@@ -550,7 +1298,7 @@ fn lss_switch_global_waiting_adopts_pending_and_boots() {
     assert_eq!(responses.len(), 1);
 }
 
-/// BUGS.md A2: configuring `0xFF` invalidates the node-id (CiA 305 §5.4.1) —
+/// docs/DESIGN-DECISIONS.md A2: configuring `0xFF` invalidates the node-id (CiA 305 §5.4.1) —
 /// the node returns to the LSS-init state, serves only LSS again and
 /// suppresses its boot-up/data services.
 #[test]
@@ -605,7 +1353,7 @@ fn lss_selective_reconfiguration_on_configured_node() {
     assert_eq!(new_id.get(), 9);
 }
 
-/// BUGS.md M4: COB 0x7E5 belongs exclusively to LSS. A frame on it that the
+/// docs/DESIGN-DECISIONS.md M4: COB 0x7E5 belongs exclusively to LSS. A frame on it that the
 /// LSS handler does not consume (here: no LSS attached at all) must be
 /// swallowed by the LSS block — never dispatched as an ordinary service. An
 /// RPDO configured on that COB-ID must not receive it.
@@ -639,7 +1387,7 @@ fn lss_cob_is_never_delivered_as_regular_service() {
 
 #[test]
 fn heartbeat_silent_during_initialising() {
-    // BUGS.md C2: the periodic producer must not emit boot-up frames while
+    // docs/DESIGN-DECISIONS.md C2: the periodic producer must not emit boot-up frames while
     // the node sits in Initialising (only `boot()` sends the single 0x00).
     // A fresh node starts in Initialising (SDO is not served yet), so arm
     // 0x1017 directly in the OD instead of via SDO.
@@ -659,7 +1407,7 @@ fn heartbeat_silent_during_initialising() {
         assert!(beats.is_empty(), "Initialising produced {beats:?}");
     }
     // Boot emits exactly one boot-up frame and starts the producer.
-    // BUGS.md 八M4: the first poll after boot anchors the heartbeat epoch;
+    // docs/DESIGN-DECISIONS.md 八M4: the first poll after boot anchors the heartbeat epoch;
     // the first periodic beat comes one full 0x1017 period later — never
     // back-to-back with boot-up.
     assert_eq!(node.boot().unwrap().payload(), &[0x00]);
@@ -670,7 +1418,7 @@ fn heartbeat_silent_during_initialising() {
     assert!(node.poll(210).iter().any(|f| f.cob_id == 0x705));
 }
 
-/// BUGS.md 八M4: on a real monotonic clock `now_ms` is far from zero when
+/// docs/DESIGN-DECISIONS.md 八M4: on a real monotonic clock `now_ms` is far from zero when
 /// the node boots (host serve loop). The old `last_hb_ms = Some(0)` made the
 /// first periodic heartbeat due immediately at the first poll, emitting a
 /// second frame back-to-back with boot-up. The epoch must instead anchor at
@@ -703,7 +1451,7 @@ fn boot_up_and_first_heartbeat_are_not_back_to_back() {
 
 #[test]
 fn writing_zero_to_1003_0_clears_emcy_history() {
-    // BUGS.md M4 (CANopenNode OD_write_1003): sub-0 write of 0 wipes the
+    // docs/DESIGN-DECISIONS.md M4 (CANopenNode OD_write_1003): sub-0 write of 0 wipes the
     // history; non-zero writes leave the live count authoritative.
     let mut node = test_node();
     node.boot().unwrap();
@@ -717,13 +1465,14 @@ fn writing_zero_to_1003_0_clears_emcy_history() {
         assert_eq!(od_value(&node, Address::new(0x1003, sub)), 0);
     }
 
-    // A bogus non-zero write is rejected with VALUE_TOO_HIGH (BUGS.md
-    // P3-39, matching CANopenNode `OD_write_1003`) and does not corrupt the
-    // count.
+    // A bogus non-zero write is rejected with INVALID_VALUE (0x0609_0030),
+    // matching CANopenNode `OD_write_1003` (`CO_Emergency.c:200-202` returns
+    // `ODR_INVALID_VALUE` → 0x0609_0030) and the sibling 0x1019 guard, and
+    // does not corrupt the count.
     let mut client = SdoClient::new();
     let first = client.write(Address::new(0x1003, 0), &[42]).unwrap();
     let aborted = transact_expect_abort(&mut node, &mut client, first);
-    assert_eq!(aborted, SdoAbortCode::ValueTooHigh);
+    assert_eq!(aborted, SdoAbortCode::InvalidValue);
     assert_eq!(od_value(&node, Address::new(0x1003, 0)), 0);
 }
 
@@ -749,7 +1498,7 @@ fn transact_expect_abort(
 
 #[test]
 fn emcy_cob_id_follows_od_1014() {
-    // BUGS.md M5 / 十M19: producer honours the writable COB-ID entry and
+    // docs/DESIGN-DECISIONS.md M5 / 十M19: producer honours the writable COB-ID entry and
     // CANopenNode `OD_write_1014`'s guards, and a low-11-bit value of 0
     // disables production.
     let mut node = test_node();
@@ -785,7 +1534,7 @@ fn emcy_cob_id_follows_od_1014() {
     assert!(node.raise_emergency(0x7000, 0x01, [0; 5]).is_none());
 }
 
-/// BUGS.md 八M3: with *only* the `StandardObjects` baseline (no
+/// docs/DESIGN-DECISIONS.md 八M3: with *only* the `StandardObjects` baseline (no
 /// `emcy::install_standard_objects`), 0x1014 defaults to node 1's EMCY COB
 /// 0x81. A node built at another id must rewrite it to `0x80+id` so its
 /// emergency frames do not collide with node 1 on the bus.
@@ -823,7 +1572,7 @@ fn standard_objects_only_emcy_cob_follows_node_id() {
 
 #[test]
 fn pdo_reconfiguration_errors_are_captured_not_swallowed() {
-    // BUGS.md m17: a broken PDO configuration must leave a trace in
+    // docs/DESIGN-DECISIONS.md m17: a broken PDO configuration must leave a trace in
     // `take_config_errors()` instead of disappearing silently.
     let mut node = test_node();
     node.boot().unwrap();
@@ -850,12 +1599,183 @@ fn pdo_reconfiguration_errors_are_captured_not_swallowed() {
     assert!(node.take_config_errors().next().is_none());
 }
 
+/// docs/DESIGN-DECISIONS.md LED-01: `Node::poll` drives the CiA 303-3 state machine; the
+/// host injects only controller health, and firmware-download is an
+/// application flag.
+#[test]
+fn node_leds_follow_can_status_and_nmt_state() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    node.poll(50);
+    assert!(!node.leds().red_on, "PreOperational without errors: no red");
+    node.set_can_status(CanStatus {
+        bus_off: true,
+        bus_warn: false,
+    });
+    node.poll(100);
+    assert!(node.leds().red_on, "bus-off raises the red ERROR LED");
+    node.set_can_status(CanStatus::default());
+    start_node(&mut node);
+    node.poll(150);
+    assert!(
+        node.leds().green_on,
+        "Operational turns the green RUN LED on"
+    );
+    assert!(!node.leds().red_on);
+}
+
+fn emcy_code(frames: &[TxFrame]) -> Option<u16> {
+    frames
+        .iter()
+        .find(|f| f.cob_id == 0x80 + u16::from(NODE))
+        .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+}
+
+/// docs/DESIGN-DECISIONS.md NMT-03: node-guarding life-time supervision. A silent master
+/// raises 0x8130 after `0x100C × 0x100D`; the next guarding RTR clears it.
+#[test]
+fn guarding_slave_reports_and_clears_life_timeout() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u16(&mut node, Address::new(0x100C, 0), 100);
+    sdo_write_u8(&mut node, Address::new(0x100D, 0), 2);
+    assert_eq!(od_value(&node, Address::new(0x100C, 0)), 100);
+    assert_eq!(od_value(&node, Address::new(0x100D, 0)), 2);
+    let hb = node.node_id().heartbeat_cob_id();
+    assert!(
+        node.on_remote_request(hb).is_some(),
+        "guarding RTR answered"
+    );
+    let frames = node.poll(0);
+    assert_eq!(emcy_code(&frames), None, "timer anchored at the RTR");
+    assert_eq!(emcy_code(&node.poll(199)), None, "inside 200 ms");
+    let frames = node.poll(201);
+    assert_eq!(
+        emcy_code(&frames),
+        Some(0x8130),
+        "silence beyond guard-time × life-factor raises 0x8130"
+    );
+    // A fresh RTR re-anchors the timer and emits the EMCY reset.
+    assert!(node.on_remote_request(hb).is_some());
+    let frames = node.poll(202);
+    assert_eq!(emcy_code(&frames), Some(0x0000), "RTR clears the EMCY");
+    assert_eq!(emcy_code(&node.poll(300)), None, "timer was re-anchored");
+
+    // Heartbeat enabled (0x1017 > 0) disables guarding supervision.
+    sdo_write_u16(&mut node, Address::new(0x1017, 0), 100);
+    assert_eq!(emcy_code(&node.poll(10_000)), None);
+}
+
+/// docs/DESIGN-DECISIONS.md NMT-06: CANopenNode-style NMT control flags. Startup-to-
+/// Operational is applied after the boot-up frame, bus-off drops Operational
+/// to PreOperational, and `err_free_to_operational` restores it.
+#[test]
+fn nmt_control_startup_and_busoff_transitions() {
+    let mut node = test_node();
+    node.set_nmt_control(NmtControl {
+        startup_to_operational: true,
+        ..NmtControl::default()
+    });
+    let boot = node.boot().unwrap();
+    assert_eq!(boot.data[0], 0x00, "boot-up still reports Initialising");
+    assert_eq!(
+        node.nmt_state(),
+        canopen_core::nmt::NmtState::Operational,
+        "startup flag enters Operational after boot"
+    );
+
+    node.set_nmt_control(NmtControl {
+        err_on_busoff_hb: true,
+        ..NmtControl::default()
+    });
+    node.set_can_status(CanStatus {
+        bus_off: true,
+        bus_warn: false,
+    });
+    node.poll(100);
+    assert_eq!(
+        node.nmt_state(),
+        canopen_core::nmt::NmtState::PreOperational,
+        "bus-off drops Operational to PreOperational"
+    );
+
+    node.set_nmt_control(NmtControl {
+        err_free_to_operational: true,
+        ..NmtControl::default()
+    });
+    node.set_can_status(CanStatus::default());
+    node.poll(200);
+    assert_eq!(
+        node.nmt_state(),
+        canopen_core::nmt::NmtState::Operational,
+        "error-free PreOperational returns to Operational"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md SYN-10: standard TIME default is 0x1012 = 0x100 with the consumer
+/// bit clear; enabling bit 31 makes the configured COB-ID consumable, and
+/// bit 30 enables the producer helper.
+#[test]
+fn time_object_configuration_controls_consumer_and_producer() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    let frame = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+    let _ = node.on_frame(0x100, &frame);
+    assert!(
+        node.take_time_events().is_empty(),
+        "default 0x1012 has consumer disabled"
+    );
+    expect_abort(
+        &mut node,
+        Address::new(0x1012, 0),
+        &0x8000_0800u32.to_le_bytes(),
+    );
+    node.od_mut()
+        .set_value(Address::new(0x1012, 0), Value::Uint(0x8000_0123))
+        .unwrap();
+    let _ = node.on_frame(0x100, &frame);
+    assert!(
+        node.take_time_events().is_empty(),
+        "0x100 is no longer TIME"
+    );
+    let _ = node.on_frame(0x123, &frame);
+    assert_eq!(node.take_time_events(), vec![frame]);
+    assert!(node.time_frame(0).unwrap().is_none(), "producer disabled");
+
+    node.od_mut()
+        .set_value(Address::new(0x1012, 0), Value::Uint(0x4000_0123))
+        .unwrap();
+    let time = node
+        .time_frame(1_700_000_000_000)
+        .unwrap()
+        .expect("producer enabled");
+    assert_eq!(time.cob_id, 0x123);
+    assert_eq!(time.payload().len(), 6);
+    assert!(node.od().entry(Address::new(0x1013, 0)).is_some());
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-23: the opt-in StrictWrite policy validates the mapping target
+/// at SDO-write time instead of letting assembly remove the slot later.
+#[test]
+fn strict_pdo_policy_rejects_missing_target_on_sdo_write() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    node.set_pdo_config_policy(PdoConfigPolicy::StrictWrite);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    let raw = MappingEntry {
+        address: Address::new(0x7777, 0),
+        bit_length: 8,
+    }
+    .to_u32();
+    expect_abort(&mut node, Address::new(0x1600, 1), &raw.to_le_bytes());
+}
+
 fn start_node(node: &mut Node) {
     // NMT StartRemoteNode, broadcast.
     let _ = node.on_frame(0x0000, &[0x01, 0x00]);
 }
 
-/// §7.4 / BUGS.md 八H1: RTR on a TPDO COB-ID answers with the current mapping
+/// §7.4 / docs/DESIGN-DECISIONS.md 八H1: RTR on a TPDO COB-ID answers with the current mapping
 /// payload only when bit30 is *clear* (CiA 301: bit30 set = RTR not allowed,
 /// same as python-canopen `RTR_NOT_ALLOWED = 1 << 30`); with bit30 set the
 /// request stays unanswered.
@@ -903,7 +1823,7 @@ fn rtr_triggers_tpdo_when_bit30_clear() {
     assert!(node2.on_remote_request(0x185).is_none());
 }
 
-/// BUGS.md 八M1: a COB-ID whose 11-bit identifier is 0 (bit31 clear, "valid")
+/// docs/DESIGN-DECISIONS.md 八M1: a COB-ID whose 11-bit identifier is 0 (bit31 clear, "valid")
 /// must never assemble a PDO slot — TPDO frames would go to the NMT command
 /// COB 0x000. SDO writes of such a COB-ID are rejected at write time
 /// (CiA/CANopenNode); a dictionary that *already* carries the value (EDS
@@ -969,7 +1889,7 @@ fn cob_id_zero_is_rejected_at_slot_build() {
     );
 }
 
-/// SDO writes of COB-ID 0 are rejected at write time (BUGS.md 八M1).
+/// SDO writes of COB-ID 0 are rejected at write time (docs/DESIGN-DECISIONS.md 八M1).
 #[test]
 fn cob_id_zero_sdo_write_is_rejected() {
     let mut node = test_node();
@@ -1010,7 +1930,134 @@ fn cob_id_zero_sdo_write_is_rejected() {
     assert_eq!(od_value(&node, Address::new(0x1800, 1)), 0x8000_0185);
 }
 
-/// BUGS.md M2: a type-252 (RtrOnlySync) TPDO answers a remote request
+/// docs/DESIGN-DECISIONS.md PDO-01: reserved transmission types are rejected at write time
+/// (`ODR_INVALID_VALUE` → 0x0609_0030) instead of landing in the OD and then
+/// silently dropping the whole PDO slot at re-assembly.
+#[test]
+fn reserved_transmission_type_sdo_write_is_rejected() {
+    let mut node = test_node();
+    node.boot().unwrap();
+
+    for tt in [241u8, 245, 251] {
+        let before = od_value(&node, Address::new(0x1800, 2));
+        let mut client = SdoClient::new();
+        let first = client
+            .write(Address::new(0x1800, 2), &[tt])
+            .expect("initiate frame");
+        assert_eq!(
+            transact_expect_abort(&mut node, &mut client, first),
+            SdoAbortCode::InvalidValue,
+            "transmission type {tt} must abort with InvalidValue"
+        );
+        assert_eq!(
+            od_value(&node, Address::new(0x1800, 2)),
+            before,
+            "a rejected transmission type must not reach the OD"
+        );
+    }
+
+    // TPDOs keep 252/253: the RTR-only responder types this stack implements.
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 252);
+    assert_eq!(od_value(&node, Address::new(0x1800, 2)), 252);
+
+    // RPDOs have no receiver-side RTR-only semantics —
+    // CANopenNode rejects 241..=253 for 14xx as well (`CO_PDO.c:540-547`).
+    let mut client = SdoClient::new();
+    let first = client
+        .write(Address::new(0x1400, 2), &[252])
+        .expect("initiate frame");
+    assert_eq!(
+        transact_expect_abort(&mut node, &mut client, first),
+        SdoAbortCode::InvalidValue
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-02: a zero-width mapping entry must not drop the whole slot —
+/// python-canopen skips such entries (`pdo/base.py:414` `if index and size:`)
+/// and CANopenNode handles them as zero-length fields (`CO_PDO.c:95-103`).
+#[test]
+fn zero_width_mapping_entry_keeps_tpdo_slot() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254); // event driven
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 2);
+    sdo_write_u32(&mut node, Address::new(0x1A00, 1), 0x6000_0108); // 0x6000:01, 8 bits
+    sdo_write_u32(&mut node, Address::new(0x1A00, 2), 0); // zero-width entry
+    start_node(&mut node);
+
+    let errs: Vec<Error> = node.take_config_errors().collect();
+    assert!(
+        node.request_tpdo(1),
+        "the TPDO slot must survive the mapping (config errors: {errs:?})"
+    );
+    let frames = node.poll(1000);
+    assert_eq!(
+        frames.len(),
+        1,
+        "zero-width entry must not silence the TPDO"
+    );
+    assert_eq!(frames[0].cob_id, 0x185);
+    assert_eq!(
+        frames[0].len, 1,
+        "the zero-width entry contributes no bytes"
+    );
+    assert_eq!(
+        node.take_config_errors().count(),
+        0,
+        "no config error must be recorded for a zero-width entry"
+    );
+}
+
+/// Reserved bits 29..11 of a PDO communication-record COB-ID must abort with
+/// `INVALID_VALUE` (0x0609_0030), like CANopenNode `OD_write_18xx` case 1
+/// (`CO_PDO.c:507-509` returns `ODR_INVALID_VALUE`) and the 0x1005/0x1014
+/// guards — not with a range code (`docs/DESIGN-DECISIONS.md` 十L2). Previously this path
+/// answered VALUE_TOO_HIGH (0x0609_0031).
+#[test]
+fn cob_id_reserved_bits_sdo_write_is_rejected() {
+    for raw in [0x0000_0800u32, 0x2000_0200, 0x3FFF_F800] {
+        let mut node = test_node();
+        node.boot().unwrap();
+        let mut client = SdoClient::new();
+        let first = client
+            .write(Address::new(0x1800, 1), &raw.to_le_bytes())
+            .expect("initiate frame");
+        assert_eq!(
+            transact_expect_abort(&mut node, &mut client, first),
+            SdoAbortCode::InvalidValue,
+            "{raw:#010x} must abort with InvalidValue"
+        );
+        // The rejected value is never stored: the predefined, disabled
+        // default survives.
+        assert_eq!(od_value(&node, Address::new(0x1800, 1)), 0x8000_0185);
+    }
+}
+
+/// docs/DESIGN-DECISIONS.md P5: a TPDO SYNC start value above 240 can never match the
+/// 0x1019-capped counter and must be rejected like CANopenNode
+/// `OD_write_18xx` case 6 (`CO_PDO.c:968-975`), leaving the previous value
+/// intact; 1..=240 stays writable.
+#[test]
+fn tpdo_sync_start_value_write_is_validated() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u8(&mut node, Address::new(0x1800, 6), 240);
+    assert_eq!(od_value(&node, Address::new(0x1800, 6)), 240);
+
+    for bad in [241u8, 255] {
+        let mut client = SdoClient::new();
+        let first = client.write(Address::new(0x1800, 6), &[bad]).unwrap();
+        assert_eq!(
+            transact_expect_abort(&mut node, &mut client, first),
+            SdoAbortCode::InvalidValue,
+            "sync start value {bad} must abort with InvalidValue"
+        );
+    }
+    assert_eq!(od_value(&node, Address::new(0x1800, 6)), 240);
+}
+
+/// docs/DESIGN-DECISIONS.md M2: a type-252 (RtrOnlySync) TPDO answers a remote request
 /// only after the first SYNC of the session — its payload is the last
 /// SYNC sample (CiA 301 §7.4.3); before any SYNC there is no valid
 /// sample to return.
@@ -1019,7 +2066,7 @@ fn rtr_only_sync_waits_for_first_sync() {
     let mut node = test_node();
     node.boot().unwrap();
     sdo_write_raw(&mut node, Address::new(0x6000, 1), &[0xAB]);
-    // bit30 clear => RTR allowed (CiA 301，BUGS.md 八H1).
+    // bit30 clear => RTR allowed (CiA 301，docs/DESIGN-DECISIONS.md 八H1).
     sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
     sdo_write_u8(&mut node, Address::new(0x1800, 2), 252); // RtrOnlySync
     sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
@@ -1042,7 +2089,7 @@ fn rtr_only_sync_waits_for_first_sync() {
     assert_eq!(frame.payload(), &[0xAB]);
 }
 
-/// BUGS.md M1: a TPDO whose mapping cannot be packed at transmit time
+/// docs/DESIGN-DECISIONS.md M1: a TPDO whose mapping cannot be packed at transmit time
 /// (callback-backed mapped object failing its read) surfaces as a config
 /// error instead of silently dropping the frame. The mapping itself is
 /// *valid* at configuration time — this exercises the pack-time error
@@ -1102,7 +2149,7 @@ fn broken_tpdo_mapping_records_config_error() {
     );
 }
 
-/// BUGS.md M3: an installed `EmcyConsumer` receives foreign EMCY frames
+/// docs/DESIGN-DECISIONS.md M3: an installed `EmcyConsumer` receives foreign EMCY frames
 /// (0x80+n, n≠self) via `on_frame`; without one the frame falls through
 /// (no panic, nothing consumed).
 #[test]
@@ -1128,7 +2175,244 @@ fn emcy_consumer_receives_foreign_emergency_frames() {
     assert_eq!(recent[0].1.code, 0x1000);
 }
 
-/// §8.2 / BUGS.md P2-6: with 0x1015 configured, EMCY frames are deferred to
+/// docs/DESIGN-DECISIONS.md EMC-01: an EMCY raised while the node is Stopped is queued, not
+/// dropped — it leaves on the first poll after entering (Pre)Operational
+/// (CANopenNode keeps it in the fifo and `CO_EM_process` sends it once
+/// `NMTisPreOrOperational` holds, `CO_Emergency.c:557-582`).
+#[test]
+fn emcy_raised_while_stopped_survives_until_preop() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    let _ = node.on_frame(0x000, &[0x02, 0x00]); // broadcast Stop
+
+    let raised = node.raise_emergency(0x2310, err_reg::GENERIC, [1, 2, 3, 4, 5]);
+    assert!(
+        raised.is_none(),
+        "nothing leaves the node while it is Stopped"
+    );
+    assert!(node.poll(10).is_empty());
+
+    let _ = node.on_frame(0x000, &[0x80, 0x00]); // back to Pre-Operational
+    let frames = node.poll(20);
+    assert_eq!(
+        frames.len(),
+        1,
+        "the queued EMCY must be released in (Pre)Operational"
+    );
+    assert_eq!(frames[0].cob_id, 0x85);
+    // Layout: code LE (0..2), error register (2), 5 info bytes (3..8).
+    assert_eq!(
+        u16::from_le_bytes([frames[0].data[0], frames[0].data[1]]),
+        0x2310
+    );
+    assert_eq!(frames[0].data[2], err_reg::GENERIC);
+    assert_eq!(&frames[0].data[3..8], &[1, 2, 3, 4, 5]);
+
+    // A clear issued while Stopped is likewise delivered, not lost.
+    let _ = node.on_frame(0x000, &[0x02, 0x00]); // Stop again
+    assert!(node.clear_emergency(0x2310).is_none());
+    let _ = node.on_frame(0x000, &[0x80, 0x00]);
+    let frames = node.poll(30);
+    assert_eq!(frames.len(), 1, "the queued error-reset frame must be sent");
+    assert_eq!(
+        u16::from_le_bytes([frames[0].data[0], frames[0].data[1]]),
+        0x0000
+    );
+    assert_eq!(frames[0].data[2], 0, "error register is empty again");
+}
+
+/// docs/DESIGN-DECISIONS.md EMC-05: writing 0x1015 restarts the inhibit window from the write
+/// (reference `OD_write_1015`: `inhibitEmTimer = 0`), so a frame raised after
+/// a *larger* window was configured waits the full new window instead of
+/// riding on the old anchor.
+#[test]
+fn emcy_inhibit_window_restarts_on_1015_write() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // 10 ms window; the write itself re-arms the timer (like the reference).
+    sdo_write_u16(&mut node, Address::new(0x1015, 0), 100);
+    let _ = node.raise_emergency(0x2001, err_reg::GENERIC, [0; 5]);
+    assert!(
+        node.poll(0).iter().all(|f| f.cob_id != 0x85),
+        "the fresh window holds the first frame back"
+    );
+    assert!(
+        node.poll(11).iter().any(|f| f.cob_id == 0x85),
+        "10 ms window elapsed"
+    );
+
+    // Raise the window to 100 ms at t≈60: the timer restarts there.
+    sdo_write_u16(&mut node, Address::new(0x1015, 0), 1000);
+    assert!(node.poll(60).iter().all(|f| f.cob_id != 0x85));
+    let _ = node.raise_emergency(0x2002, err_reg::GENERIC, [0; 5]);
+    // t=115 is past the *old* anchor (11 + 100) but only 55 ms after the
+    // re-arm — the reference still inhibits it.
+    assert!(
+        node.poll(115).iter().all(|f| f.cob_id != 0x85),
+        "window restarted at the 0x1015 write"
+    );
+    assert!(
+        node.poll(170).iter().any(|f| f.cob_id == 0x85),
+        "100 ms after the write the frame is released"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md SYN-08: a node that declares itself the SYNC producer
+/// (0x1005 bit30) consumes SYNC frames but does not run the consumer-side
+/// silence supervision (`CO_SYNC.c:335-351`).
+#[test]
+fn sync_supervision_skipped_for_declared_producer() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1006, 0), 100);
+    // Producer flag + the default SYNC COB-ID 0x080.
+    sdo_write_u32(&mut node, Address::new(0x1005, 0), (1 << 30) | 0x080);
+    start_node(&mut node);
+    let _ = node.on_frame(0x080, &[]);
+    assert!(node.poll(1_000).iter().all(|f| f.cob_id != 0x85));
+    assert!(
+        node.poll(5_000).iter().all(|f| f.cob_id != 0x85),
+        "a declared producer must not supervise its own SYNC period"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md SYN-01: with 0x1006 configured the SYNC consumer reports the
+/// SYNC-timeout condition (`0x8100` + CANopenNode's error bit `0x18`) once no
+/// SYNC arrived within 1.5× the period, and clears it with the next SYNC
+/// (`CO_SYNC.c:334-363,400-406`).
+#[test]
+fn sync_timeout_is_reported_and_cleared() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // 0x1006 is readWrite (SYN-07): configure the period through the normal
+    // SDO path a master would use, instead of poking the OD directly.
+    sdo_write_u32(&mut node, Address::new(0x1006, 0), 100);
+    assert_eq!(od_value(&node, Address::new(0x1006, 0)), 100);
+    start_node(&mut node);
+
+    // docs/DESIGN-DECISIONS.md SYN-08: before the *first* SYNC ever arrives nothing is timed —
+    // a master that starts producing late must not raise a phantom 0x8100.
+    assert!(node.poll(1_000).iter().all(|f| f.cob_id != 0x85));
+    assert!(
+        node.poll(5_000).iter().all(|f| f.cob_id != 0x85),
+        "no supervision before the first SYNC"
+    );
+    // First SYNC observed: the epoch anchors on the observing poll.
+    let _ = node.on_frame(0x080, &[]);
+    assert!(node.poll(1_010).iter().all(|f| f.cob_id != 0x85));
+
+    // 190 ms > 1.5 × 100 ms without a SYNC → exactly one timeout EMCY.
+    let frames = node.poll(1_200);
+    let emcy: Vec<_> = frames.iter().filter(|f| f.cob_id == 0x85).collect();
+    assert_eq!(emcy.len(), 1, "SYNC timeout must be reported: {frames:?}");
+    assert_eq!(
+        u16::from_le_bytes([emcy[0].data[0], emcy[0].data[1]]),
+        0x8100
+    );
+    assert_eq!(emcy[0].data[2], err_reg::COMMUNICATION);
+    assert_eq!(
+        emcy[0].data[3], 0x18,
+        "CANopenNode carries CO_EM_SYNC_TIME_OUT in the first manufacturer byte"
+    );
+    // SYN-08: the vendor info is the *measured* silence in µs
+    // (1200 ms − 1010 ms = 190 ms), like the reference's `SYNC->timer`.
+    assert_eq!(
+        u32::from_le_bytes([
+            emcy[0].data[4],
+            emcy[0].data[5],
+            emcy[0].data[6],
+            emcy[0].data[7]
+        ]),
+        190_000
+    );
+
+    // The condition is a single error bit — polling again must not re-report.
+    assert_eq!(
+        node.poll(1_300).iter().filter(|f| f.cob_id == 0x85).count(),
+        0
+    );
+
+    // The next SYNC clears it with the 0x0000 error-reset frame.
+    let _ = node.on_frame(0x080, &[]);
+    let frames = node.poll(1_400);
+    let reset: Vec<_> = frames.iter().filter(|f| f.cob_id == 0x85).collect();
+    assert_eq!(
+        reset.len(),
+        1,
+        "the next SYNC clears the timeout: {frames:?}"
+    );
+    assert_eq!(
+        u16::from_le_bytes([reset[0].data[0], reset[0].data[1]]),
+        0x0000
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md SYN-12: the SYNC silence supervision must survive an NMT
+/// Stop → Start cycle. CANopenNode keeps `timeoutError` across the
+/// not-(Pre)Operational branch (only the µs timer is zeroed,
+/// `CO_SYNC.c:394-406`) and therefore reports 0x8100 again 1.5 × period
+/// after the node comes back — even if no SYNC arrived in between.
+#[test]
+fn sync_supervision_survives_stop_start_cycle() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1006, 0), 100);
+    start_node(&mut node);
+
+    // See one SYNC, then stop the node and let time pass.
+    let _ = node.on_frame(0x080, &[]);
+    assert!(node.poll(1_000).iter().all(|f| f.cob_id != 0x85));
+    let _ = node.on_frame(0x000, &[0x02, NODE]); // Stop
+    assert!(node.poll(1_500).iter().all(|f| f.cob_id != 0x85));
+    start_node(&mut node);
+
+    // First poll back in (Pre)Op re-anchors the window (the reference's
+    // `timer = 0`), so 150 ms later — more than 1.5 × 100 ms — the timeout
+    // must be reported. Before the SYN-12 fix this never fired again.
+    assert!(
+        node.poll(2_000).iter().all(|f| f.cob_id != 0x85),
+        "the re-anchored window is still open"
+    );
+    let emcy: Vec<TxFrame> = node
+        .poll(2_200)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x85)
+        .collect();
+    assert_eq!(
+        emcy.len(),
+        1,
+        "a SYNC producer that stays silent after Start must be reported: {emcy:?}"
+    );
+    assert_eq!(
+        u16::from_le_bytes([emcy[0].data[0], emcy[0].data[1]]),
+        0x8100
+    );
+    assert_eq!(emcy[0].data[3], 0x18, "CO_EM_SYNC_TIME_OUT");
+}
+
+/// docs/DESIGN-DECISIONS.md SYN-12 (second half): a communication reset re-initialises the
+/// SYNC consumer, so the node must not report a timeout for SYNCs that were
+/// never observed in the new epoch (CANopenNode re-runs `CO_SYNC_init`).
+#[test]
+fn sync_supervision_rearms_only_after_a_fresh_sync_after_reset() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1006, 0), 100);
+    start_node(&mut node);
+    let _ = node.on_frame(0x080, &[]); // arm the supervision
+    assert!(node.poll(1_000).iter().all(|f| f.cob_id != 0x85));
+
+    // Reset communication: the SYNC consumer is re-initialised (the node
+    // re-boots into PreOperational, hence the Start afterwards).
+    let _ = node.on_frame(0x000, &[0x82, NODE]);
+    start_node(&mut node);
+    assert!(
+        node.poll(5_000).iter().all(|f| f.cob_id != 0x85),
+        "a reset node has seen no SYNC in this epoch yet"
+    );
+}
+
+/// §8.2 / docs/DESIGN-DECISIONS.md P2-6: with 0x1015 configured, EMCY frames are deferred to
 /// `poll` and spaced at least the inhibit window apart.
 #[test]
 fn emcy_inhibit_defers_frames_to_poll() {
@@ -1136,23 +2420,102 @@ fn emcy_inhibit_defers_frames_to_poll() {
     node.boot().unwrap();
     sdo_write_u16(&mut node, Address::new(0x1015, 0), 100); // 100 * 100 µs = 10 ms
 
-    // The FIRST EMCY has no predecessor: it releases on the next poll.
+    // docs/DESIGN-DECISIONS.md EMC-05: the 0x1015 write itself restarts the timer
+    // (`OD_write_1015`: `inhibitEmTimer = 0`), so even the FIRST EMCY waits a
+    // full 10 ms window measured from the write (anchored at the first poll).
     let raised = node.raise_emergency(0x1111, 0, [0; 5]);
     assert!(raised.is_none(), "raise itself stays silent under inhibit");
-    let frames = node.poll(5);
+    assert!(
+        node.poll(5).is_empty(),
+        "window restarted at the write, not before it"
+    );
+    let frames = node.poll(16);
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].cob_id, 0x85);
     assert_eq!(&frames[0].payload()[..2], &0x1111u16.to_le_bytes());
 
     // A second event waits a full window since the previous emission.
     assert!(node.raise_emergency(0x2222, 0, [0; 5]).is_none());
-    assert!(node.poll(14).is_empty()); // only 9 ms since the first EMCY
-    let frames = node.poll(15);
+    assert!(node.poll(25).is_empty()); // only 9 ms since the first EMCY
+    let frames = node.poll(26);
     assert_eq!(frames.len(), 1);
     assert_eq!(&frames[0].payload()[..2], &0x2222u16.to_le_bytes());
 }
 
-/// §7.4/§7.5 / BUGS.md P2-7: an armed RPDO slot whose event timer expires
+/// docs/DESIGN-DECISIONS.md EMC-15: a **disabled producer** (0x1014 bit31 or COB-ID 0) gates
+/// sending only — CANopenNode's `CO_error` writes the EMCY fifo
+/// unconditionally (`CO_Emergency.c:688-706`) and its dequeue has no enable
+/// gate either (`:571-582`). Frames raised while disabled must therefore be
+/// *parked*, and go out once the producer is enabled again.
+#[test]
+fn emcy_frames_raised_while_producer_disabled_are_queued_not_dropped() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Disable EMCY production (0x1014 bit31).
+    sdo_write_u32(&mut node, Address::new(0x1014, 0), 0x8000_0000 | 0x85);
+
+    assert!(
+        node.raise_emergency(0x1111, err_reg::GENERIC, [0; 5])
+            .is_none(),
+        "a disabled producer transmits nothing"
+    );
+    assert!(
+        node.poll(10).is_empty(),
+        "and the parked frame is not sent while still disabled"
+    );
+    assert!(
+        node.poll(100).is_empty(),
+        "nor later while disabled — the queue holds it"
+    );
+
+    // Re-enable: the queued frame leaves on the next poll.
+    sdo_write_u32(&mut node, Address::new(0x1014, 0), 0x85);
+    let frames = node.poll(200);
+    assert_eq!(frames.len(), 1, "the parked frame is delivered: {frames:?}");
+    assert_eq!(frames[0].cob_id, 0x85);
+    assert_eq!(&frames[0].payload()[..2], &0x1111u16.to_le_bytes());
+
+    // The same holds for a clear frame raised while disabled.
+    sdo_write_u32(&mut node, Address::new(0x1014, 0), 0x8000_0000 | 0x85);
+    assert!(node.clear_emergency(0x1111).is_none());
+    assert!(node.poll(300).is_empty());
+    sdo_write_u32(&mut node, Address::new(0x1014, 0), 0x85);
+    let frames = node.poll(400);
+    assert_eq!(frames.len(), 1, "the parked reset frame is delivered");
+    assert_eq!(&frames[0].payload()[..2], &0x0000u16.to_le_bytes());
+}
+
+/// docs/DESIGN-DECISIONS.md EMC-06: entering Operational no longer re-announces **every**
+/// active condition — CANopenNode only dequeues entries it has not sent yet
+/// (`CO_Emergency.c:571-582`), and since EMC-15 the unsent ones are exactly
+/// what `pending_emcy` holds.
+#[test]
+fn entering_operational_does_not_resend_already_sent_emergencies() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    start_node(&mut node);
+
+    // Sent once in this Operational epoch…
+    let out = node.raise_emergency(0x1111, err_reg::GENERIC, [0; 5]);
+    assert!(out.is_some(), "the frame goes out immediately");
+
+    // …and not again when the node is stopped and started afresh.
+    let _ = node.on_frame(0x000, &[0x02, NODE]); // Stop
+    assert!(node.poll(10).is_empty());
+    start_node(&mut node);
+    let frames = node.poll(20);
+    assert!(
+        frames.iter().all(|f| f.cob_id != 0x85),
+        "an already-sent condition must not be re-announced: {frames:?}"
+    );
+    // The condition is still active and visible through the OD.
+    assert_eq!(
+        od_value(&node, Address::new(0x1001, 0)),
+        u64::from(err_reg::GENERIC)
+    );
+}
+
+/// §7.4/§7.5 / docs/DESIGN-DECISIONS.md P2-7: an armed RPDO slot whose event timer expires
 /// without traffic reports exactly once per silent window via
 /// `take_rpdo_timeouts`, re-arming after traffic resumes.
 #[test]
@@ -1198,7 +2561,68 @@ fn rpdo_event_timer_reports_timeout_once_per_window() {
     assert_eq!(node.take_rpdo_timeouts(), vec![Address::new(0x1400, 0)]);
 }
 
-/// BUGS.md P2 (third-round review): the deadman must compare elapsed time
+/// docs/DESIGN-DECISIONS.md 七F2: a lapsed RPDO dead line is also reported as EMCY 0x8250
+/// (communication error) and reset when traffic resumes — CANopenNode
+/// `CO_errorReport`/`CO_errorReset` (`CO_PDO.c:822-831`). Previously only
+/// `take_rpdo_timeouts` surfaced the condition, so a supervising master
+/// could not see it via EMCY.
+#[test]
+fn rpdo_timeout_raises_and_recovers_emcy() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 254);
+    sdo_write_u16(&mut node, Address::new(0x1400, 5), 10); // dead line 10 ms
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 2),
+            bit_length: 16,
+        }
+        .to_u32(),
+    );
+    start_node(&mut node);
+
+    // Arm the deadman; inside the window there is no EMCY.
+    let _ = node.on_frame(0x205, &[0x34, 0x12]);
+    assert!(node.poll(5).iter().all(|f| f.cob_id != 0x85));
+
+    // Timeout → exactly one 0x8250 frame with the communication bit set.
+    let out = node.poll(50);
+    let emcy: Vec<TxFrame> = out.into_iter().filter(|f| f.cob_id == 0x85).collect();
+    assert_eq!(emcy.len(), 1, "timeout must raise one EMCY frame");
+    assert_eq!(&emcy[0].payload()[..2], &0x8250u16.to_le_bytes());
+    assert_ne!(emcy[0].payload()[2] & 0x10, 0, "communication bit");
+    // EMC-14/EMC-17: `[errorBit = CO_EM_RPDO_TIME_OUT, infoLE(4)]` in frame
+    // bytes 3..8, and the infoCode is the **measured** silence in
+    // microseconds (`RPDO->timeoutTimer`, `CO_PDO.c:831`) — here 50 ms − 5 ms
+    // (last observed traffic) = 45 ms, not the configured 10 ms window.
+    assert_eq!(emcy[0].payload()[3], 0x17);
+    assert_eq!(
+        &emcy[0].payload()[4..8],
+        &45_000u32.to_le_bytes(),
+        "vendor info is the measured elapsed time in µs"
+    );
+
+    // Persistent silence must not re-raise the (idempotent) condition.
+    assert!(node.poll(80).iter().all(|f| f.cob_id != 0x85));
+
+    // Traffic resumes → the reset/no-error frame.
+    let _ = node.on_frame(0x205, &[0x00, 0x00]);
+    let out = node.poll(90);
+    let reset: Vec<TxFrame> = out.into_iter().filter(|f| f.cob_id == 0x85).collect();
+    assert_eq!(reset.len(), 1, "recovery must emit an error-reset frame");
+    assert_eq!(&reset[0].payload()[..2], &[0x00, 0x00]);
+    // EMC-17: CANopenLinux's `CO_errorReset` carries the timer next to
+    // `CO_EMC_NO_ERROR` (`CO_PDO.c:823`, `CO_Emergency.c:668,673-675`), so
+    // the reset frame repeats the elapsed time that was reported.
+    assert_eq!(reset[0].payload()[3], 0x17);
+    assert_eq!(&reset[0].payload()[4..8], &45_000u32.to_le_bytes());
+}
+
+/// docs/DESIGN-DECISIONS.md P2 (third-round review): the deadman must compare elapsed time
 /// against `event_timer_ms`. Polling *inside* an unexpired window — as the
 /// host's ~5 ms serve loop does constantly — must never report a timeout,
 /// no matter how many polls pass since arming.
@@ -1238,7 +2662,7 @@ fn rpdo_event_timer_does_not_report_inside_window() {
     assert_eq!(node.take_rpdo_timeouts(), vec![Address::new(0x1400, 0)]);
 }
 
-/// BUGS.md B6: an under-long RPDO is rejected and must not count as traffic —
+/// docs/DESIGN-DECISIONS.md B6: an under-long RPDO is rejected and must not count as traffic —
 /// it may not push the event-timer deadline forward (CANopenNode only sets
 /// `CANrxNew` on an accepted frame, `CO_PDO.c:442-475`).
 #[test]
@@ -1267,10 +2691,14 @@ fn short_rpdo_does_not_rearm_event_deadline() {
     // At t=90 a short frame (1 byte < declared 2) raises 0x8210 but must not
     // re-arm the window.
     let out = node.on_frame(0x205, &[0xAA]);
-    assert!(
-        out.iter().any(|f| f.cob_id == 0x80 + u16::from(NODE)),
-        "short frame must report 0x8210"
-    );
+    let short = out
+        .iter()
+        .find(|f| f.cob_id == 0x80 + u16::from(NODE))
+        .expect("short frame must report 0x8210");
+    assert_eq!(&short.payload()[..2], &0x8210u16.to_le_bytes());
+    // EMC-14: [errorBit, declared length LE] in frame 3..8.
+    assert_eq!(short.payload()[3], 0x04);
+    assert_eq!(&short.payload()[4..8], &2u32.to_le_bytes());
     node.poll(90);
     assert!(node.take_rpdo_timeouts().is_empty(), "window still open");
 
@@ -1280,7 +2708,7 @@ fn short_rpdo_does_not_rearm_event_deadline() {
     assert_eq!(od_value(&node, Address::new(0x6000, 2)), 0x1234);
 }
 
-/// BUGS.md P3 (third-round review): heartbeat interception must only claim
+/// docs/DESIGN-DECISIONS.md P3 (third-round review): heartbeat interception must only claim
 /// COB-IDs of *supervised* nodes. A custom RPDO configured anywhere else in
 /// `0x700..=0x77F` (legal via bit31/30 semantics or `$NODEID+offset`) must
 /// still reach the RPDO dispatch and update the dictionary.
@@ -1316,7 +2744,39 @@ fn rpdo_cob_id_inside_heartbeat_range_is_not_swallowed() {
     assert!(node.take_rpdo_timeouts().is_empty());
 }
 
-/// §7.2 / BUGS.md P2-5: a configured SYNC start value only phase-locks when
+/// docs/DESIGN-DECISIONS.md N7: our *own* heartbeat COB-ID (0x700+id) is not globally
+/// reserved either. An RPDO slot claiming it must win over the heartbeat
+/// swallow path (CANopenNode registers RX filters per COB,
+/// `CO_HBconsumer.c:203-213`).
+#[test]
+fn own_heartbeat_cob_id_claimed_by_rpdo_is_not_swallowed() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // 0x705 = *our own* HB slot (node 5).
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x705);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 254);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 2),
+            bit_length: 16,
+        }
+        .to_u32(),
+    );
+    start_node(&mut node);
+
+    let _ = node.on_frame(0x705, &[0x34, 0x12]);
+    assert_eq!(
+        od_value(&node, Address::new(0x6000, 2)),
+        0x1234,
+        "an RPDO on our own heartbeat COB-ID must still unpack"
+    );
+    assert!(node.take_rpdo_timeouts().is_empty());
+}
+
+/// §7.2 / docs/DESIGN-DECISIONS.md P2-5: a configured SYNC start value only phase-locks when
 /// 0x1019 (counter overflow) is non-zero; otherwise cyclic TPDOs run from
 /// the first SYNC even without counters.
 #[test]
@@ -1351,16 +2811,45 @@ fn sync_start_value_requires_counter_overflow() {
     let tpdos: Vec<TxFrame> = node.on_frame(0x080, &[]).into_iter().collect();
     assert_eq!(tpdos.len(), 1, "start value ignored while counters are off");
 
-    // With 0x1019 set, phase-locking applies again. A counter byte is now
-    // mandatory (BUGS.md 八M11): send a non-matching counter while waiting.
+    // docs/DESIGN-DECISIONS.md PDO-26: turning 0x1019 on afterwards does **not** park the
+    // already-transmitting TPDO1 back into the start-value wait — the
+    // reference consumes `syncStartValue` only while seeding a fresh slot
+    // (`CO_PDO.c:1315-1336`) and `OD_write_1019` never touches
+    // `syncCounter` (`:139-169`).
     sdo_write_u8(&mut node, Address::new(0x1019, 0), 240);
-    let none: Vec<TxFrame> = node.on_frame(0x080, &[0]).into_iter().collect();
-    assert!(none.is_empty(), "waiting for counter == start value");
+    let still: Vec<TxFrame> = node.on_frame(0x080, &[0]).into_iter().collect();
+    assert_eq!(
+        still.len(),
+        1,
+        "a running TPDO is not re-gated by a later 0x1019 write"
+    );
+
+    // A *fresh* slot (TPDO2, enabled after 0x1019 was set) does phase-lock:
+    // a counter byte is mandatory (docs/DESIGN-DECISIONS.md 八M11), so a non-matching counter
+    // while waiting produces nothing and the matching one transmits.
+    sdo_write_u8(&mut node, Address::new(0x1801, 2), 1);
+    sdo_write_u8(&mut node, Address::new(0x1801, 6), 3);
+    sdo_write_u8(&mut node, Address::new(0x1A01, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A01, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1801, 1), 0x285);
+    let none: Vec<TxFrame> = node.on_frame(0x080, &[4]).into_iter().collect();
+    assert!(
+        none.iter().all(|f| f.cob_id != 0x285),
+        "waiting for counter == start value: {none:?}"
+    );
     let hit: Vec<TxFrame> = node.on_frame(0x080, &[3]).into_iter().collect();
-    assert_eq!(hit.len(), 1);
+    assert_eq!(hit.iter().filter(|f| f.cob_id == 0x285).count(), 1);
 }
 
-/// BUGS.md #27: the first SyncCyclic frame goes out at the middle of the
+/// docs/DESIGN-DECISIONS.md #27: the first SyncCyclic frame goes out at the middle of the
 /// first period (`n/2 + 1` SYNCs observed), exactly like CANopenNode
 /// `CO_PDO.c:1315-1321` — not after a full period.
 #[test]
@@ -1398,7 +2887,7 @@ fn sync_cyclic_first_frame_at_period_midpoint() {
     assert_eq!(next.len(), 1, "steady state period is n SYNCs");
 }
 
-/// §7.2 / BUGS.md P1-12: `set_node_id` rewrites identity-dependent default
+/// §7.2 / docs/DESIGN-DECISIONS.md P1-12: `set_node_id` rewrites identity-dependent default
 /// COB-IDs (EMCY + predefined PDO entries) while custom values survive.
 #[test]
 fn set_node_id_rewrites_predefined_cobs_only() {
@@ -1427,7 +2916,7 @@ fn set_node_id_rewrites_predefined_cobs_only() {
     );
 }
 
-/// §6.5 / §10.3 / BUGS.md P1-11: writing OD 0x1016 configures the heartbeat
+/// §6.5 / §10.3 / docs/DESIGN-DECISIONS.md P1-11: writing OD 0x1016 configures the heartbeat
 /// consumer immediately; supervised heartbeats produce Started/Lost events
 /// through `poll` + `take_hb_events`.
 #[test]
@@ -1462,9 +2951,98 @@ fn od_heartbeat_consumer_configures_and_times_out() {
     assert!(!events.iter().any(|e| matches!(e, HbEvent::Started { .. })));
 }
 
-// --- BUGS.md P2-1 / P2-3 regressions -----------------------------------------
+/// docs/DESIGN-DECISIONS.md 七F3: heartbeat supervision follows the node's own NMT state.
+/// While Stopped a node must neither time out remote entries nor report
+/// `Lost` (CANopenNode gates `CO_HBconsumer_process` on
+/// `NMTisPreOrOperational`, `CO_HBconsumer.c:304-311`), and any Pre/Op edge
+/// resets the tracked state (`:404-417`) so a stale `last_seen` cannot fire
+/// an immediate false `Lost` after a long Stop.
+#[test]
+fn heartbeat_supervision_freezes_while_stopped() {
+    use canopen_core::nmt::HbEvent;
 
-/// BUGS.md P2-1: the SYNC start-value phase lock is one-shot. After the
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1016, 1), (7 << 16) | 30);
+    start_node(&mut node);
+
+    let _ = node.on_frame(0x707, &[0x05]);
+    node.poll(10);
+    assert!(node
+        .take_hb_events()
+        .iter()
+        .any(|e| matches!(e, HbEvent::Started { node } if node.get() == 7)));
+
+    // Stopped: long past the deadline there must be no Lost.
+    let _ = node.on_frame(0x000, &[0x02, 0x00]); // Stop
+    node.poll(500);
+    assert!(
+        !node
+            .take_hb_events()
+            .iter()
+            .any(|e| matches!(e, HbEvent::Lost { .. })),
+        "a Stopped node must not report remote timeouts"
+    );
+
+    // Re-enter PreOperational: the old last_seen (t=10) is discarded by the
+    // edge, so polling must not immediately report Lost.
+    let _ = node.on_frame(0x000, &[0x80, 0x00]);
+    node.poll(510);
+    assert!(
+        !node
+            .take_hb_events()
+            .iter()
+            .any(|e| matches!(e, HbEvent::Lost { .. })),
+        "stale last_seen must not survive the NMT edge"
+    );
+
+    // A fresh heartbeat re-announces Started (phase was reset).
+    let _ = node.on_frame(0x707, &[0x05]);
+    node.poll(520);
+    assert!(node
+        .take_hb_events()
+        .iter()
+        .any(|e| matches!(e, HbEvent::Started { node } if node.get() == 7)));
+}
+
+// --- docs/DESIGN-DECISIONS.md P2-1 / P2-3 regressions -----------------------------------------
+
+/// docs/DESIGN-DECISIONS.md NMT-01: falling into a supervised node must be reported **Lost**
+/// after an NMT edge that stays inside `{PreOperational, Operational}`
+/// (Start = Pre→Op, EnterPreOp = Op→Pre). The old `||` condition cleared the
+/// supervision state on such edges, and `Phase::Unknown` never times out, so
+/// a node that went quiet after a Start/EnterPreOp could never be reported.
+#[test]
+fn nmt_edge_inside_preop_op_keeps_heartbeat_supervision() {
+    use canopen_core::nmt::HbEvent;
+
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1016, 1), (9 << 16) | 30);
+
+    // Pre→Op (in-set edge): supervision must survive.
+    start_node(&mut node);
+    let _ = node.on_frame(0x709, &[0x05]);
+    node.poll(10);
+    assert!(node
+        .take_hb_events()
+        .iter()
+        .any(|e| matches!(e, HbEvent::Started { node } if node.get() == 9)));
+
+    // Op→Pre (also in-set): supervision must survive this edge too.
+    let _ = node.on_frame(0x000, &[0x80, 0x00]);
+
+    // 30ms deadline long past -> the quiet node must still be reported Lost.
+    node.poll(100);
+    assert!(
+        node.take_hb_events()
+            .iter()
+            .any(|e| matches!(e, HbEvent::Lost { .. })),
+        "an in-set NMT edge must not disable heartbeat supervision"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md P2-1: the SYNC start-value phase lock is one-shot. After the
 /// counter first matches the start value, cyclic transmission must continue
 /// on every Nth SYNC *without* requiring counter == start again (previously
 /// the lock was re-armed after every send, silencing the TPDO until the
@@ -1503,7 +3081,7 @@ fn sync_start_value_locks_once_and_stays_locked() {
     assert!(node.on_frame(0x080, &[1]).is_empty());
     assert!(node.on_frame(0x080, &[2]).is_empty());
     // counter == start → phase locks AND the TPDO goes out immediately
-    // (CANopenNode `CO_PDO.c:1325-1329`, BUGS.md 八L3).
+    // (CANopenNode `CO_PDO.c:1325-1329`, docs/DESIGN-DECISIONS.md 八L3).
     let hit = node.on_frame(0x080, &[3]);
     assert_eq!(hit.len(), 1, "matching SYNC sends immediately");
 
@@ -1515,7 +3093,7 @@ fn sync_start_value_locks_once_and_stays_locked() {
     assert!(node.on_frame(0x080, &[7]).is_empty());
 }
 
-/// BUGS.md P2-3: transmission type 0 (synchronous acyclic) TPDOs accept an
+/// docs/DESIGN-DECISIONS.md P2-3: transmission type 0 (synchronous acyclic) TPDOs accept an
 /// application request via `request_tpdo` and transmit it on the next SYNC.
 #[test]
 fn sync_acyclic_tpdo_fires_on_request_plus_sync() {
@@ -1536,7 +3114,15 @@ fn sync_acyclic_tpdo_fires_on_request_plus_sync() {
     sdo_write_raw(&mut node, Address::new(0x6000, 1), &[0x42]);
     start_node(&mut node);
 
-    // SYNC without a pending request: silent.
+    // 七F1: entering Operational arms one initial frame (CANopenNode
+    // `sendRequest = true`, `CO_PDO.c:1345`); the first SYNC transmits it.
+    let initial = node.on_frame(0x080, &[]);
+    assert_eq!(
+        initial.len(),
+        1,
+        "entering Operational sends one initial frame"
+    );
+    // The initial request is consumed: further SYNCs stay silent.
     assert!(node.on_frame(0x080, &[]).is_empty());
     // Request latches…
     assert!(node.request_tpdo(1), "tt=0 accepts application requests");
@@ -1552,15 +3138,72 @@ fn sync_acyclic_tpdo_fires_on_request_plus_sync() {
     assert!(!node.request_tpdo(1));
 }
 
+/// docs/DESIGN-DECISIONS.md N1: tt=0 (SyncAcyclic) also runs the communication record's event
+/// timer (CANopenNode `CO_PDO.c:1245-1252`). Expiry arms the slot; the frame
+/// leaves at the next SYNC and re-anchors the window
+/// (`CO_TPDOsend` re-arms `eventTimer`, `:1223`).
+#[test]
+fn sync_acyclic_event_timer_arms_the_next_sync() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 0); // SyncAcyclic
+    sdo_write_u16(&mut node, Address::new(0x1800, 5), 50); // event timer 50 ms
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_raw(&mut node, Address::new(0x6000, 1), &[0x42]);
+    start_node(&mut node);
+
+    // A never-transmitted slot starts with an expired timer (the reference
+    // initialises `eventTimer = 0` / `sendRequest = true`): the first poll
+    // arms it and the first SYNC emits the initial frame.
+    node.poll(0);
+    let first = node.on_frame(0x080, &[]);
+    assert_eq!(first.len(), 1, "first SYNC emits the initial frame");
+    assert_eq!(first[0].cob_id, 0x185);
+
+    // The transmission re-anchors the window at the next poll.
+    node.poll(50);
+    assert!(
+        node.on_frame(0x080, &[]).is_empty(),
+        "window just re-armed by the last transmission"
+    );
+    node.poll(99);
+    assert!(
+        node.on_frame(0x080, &[]).is_empty(),
+        "still inside the 50 ms window"
+    );
+
+    // Expiry arms the next SYNC exactly once.
+    node.poll(100);
+    assert_eq!(
+        node.on_frame(0x080, &[]).len(),
+        1,
+        "event-timer expiry must arm the next SYNC"
+    );
+    node.poll(150);
+    assert!(node.on_frame(0x080, &[]).is_empty());
+    node.poll(200);
+    assert_eq!(node.on_frame(0x080, &[]).len(), 1);
+}
+
 /// Re-runs PDO assembly by touching a comm parameter through SDO semantics.
 fn rebuild_pdos_via_sdo_touch(node: &mut Node) {
     // 0x1800:5 (event timer) is UNSIGNED16.
     sdo_write_raw(node, Address::new(0x1800, 5), &[0x00, 0x00]);
 }
 
-// --- BUGS.md 批次 B 回归（P2-4 / P3-11 / P3-13 / P3-17 / P3-22）---------------
+// --- docs/DESIGN-DECISIONS.md 批次 B 回归（P2-4 / P3-11 / P3-13 / P3-17 / P3-22）---------------
 
-/// BUGS.md P2-4: a synchronous RPDO buffers its payload until the next SYNC;
+/// docs/DESIGN-DECISIONS.md P2-4: a synchronous RPDO buffers its payload until the next SYNC;
 /// OD reads before the boundary still see the previous cycle's values.
 #[test]
 fn sync_rpdo_applies_data_only_after_sync() {
@@ -1590,7 +3233,7 @@ fn sync_rpdo_applies_data_only_after_sync() {
     assert_eq!(od_value(&node, Address::new(0x6000, 1)), 0xAB);
 }
 
-/// BUGS.md C3: leaving Operational discards a buffered synchronous RPDO —
+/// docs/DESIGN-DECISIONS.md C3: leaving Operational discards a buffered synchronous RPDO —
 /// the stale sample must not be applied at the first SYNC after a restart
 /// (CANopenNode `CO_PDO.c:846-862` clears both directions).
 #[test]
@@ -1620,11 +3263,16 @@ fn leaving_operational_discards_buffered_sync_rpdo() {
     assert_eq!(od_value(&node, Address::new(0x6000, 1)), 0);
 }
 
-/// BUGS.md R10-P2-12: a minimal RPDO record (only sub 1 COB-ID, no sub 2
-/// transmission type) defaults to *synchronous* per CiA 301 — the payload is
-/// buffered until the next SYNC, not applied immediately.
+/// docs/DESIGN-DECISIONS.md PDO-24（取代 R10-P2-12 的旧口径）: a minimal RPDO record (only
+/// sub 1 COB-ID, no sub 2 transmission type) now defaults to **254 — apply
+/// immediately**, like CANopenNode (`CO_PDO.c:654-655`, pre-loaded
+/// `CO_PDO_TRANSM_TYPE_SYNC_EVENT_LO` for both directions) and python-canopen
+/// (`pdo/base.py:209,377`, which leaves `trans_type = None` and applies
+/// immediately). The transmission type is a mandatory CiA 301 field, so the
+/// earlier "0 = synchronous" default was invented — and on a network without a
+/// SYNC producer it kept a minimal RPDO from ever reaching the OD.
 #[test]
-fn minimal_rpdo_record_defaults_to_synchronous() {
+fn minimal_rpdo_record_applies_immediately() {
     // Build a node whose RPDO1 comm record has NO sub 2 at all (unlike
     // `test_node`, whose `install_pdo_objects` pre-seeds sub 2 = 254).
     let mut od = StandardObjects::new().device_type(0x1234).build();
@@ -1669,16 +3317,323 @@ fn minimal_rpdo_record_defaults_to_synchronous() {
     node.boot().unwrap();
     start_node(&mut node);
 
-    // Frame arrives: NOT yet visible in the OD (buffered for SYNC).
+    // Frame arrives and lands in the OD right away — the missing sub 2 means
+    // "apply immediately", not "buffer for the next SYNC".
     let _ = node.on_frame(0x205, &[0xCD]);
-    assert_eq!(od_value(&node, Address::new(0x6000, 1)), 0, "buffered");
-
-    // The next SYNC applies it — the default is synchronous, not 254.
-    let _ = node.on_frame(0x080, &[]);
-    assert_eq!(od_value(&node, Address::new(0x6000, 1)), 0xCD);
+    assert_eq!(od_value(&node, Address::new(0x6000, 1)), 0xCD, "applied");
 }
 
-/// BUGS.md P3-17: malformed SYNC payloads (>1 byte) must not drive the
+/// docs/DESIGN-DECISIONS.md PDO-25 ①: the RPDO length condition of a **synchronous** RPDO is
+/// announced inside CANopenNode's process gate
+/// (`PDO->valid && NMTisOperational && (syncWas || !synchronous)`,
+/// `CO_PDO.c:717-728`), i.e. at the next SYNC — not when the frame arrives.
+#[test]
+fn synchronous_rpdo_length_error_is_announced_at_the_next_sync() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Fill RPDO1 as synchronous (tt = 0) while disabled (docs/DESIGN-DECISIONS.md PDO-03).
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x8000_0000 | 0x205);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 0);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
+    start_node(&mut node);
+    let emcy = 0x80 + u16::from(NODE);
+
+    // Under-long frame: nothing on the bus yet, nothing applied.
+    let out = node.on_frame(0x205, &[]);
+    assert!(
+        out.iter().all(|f| f.cob_id != emcy),
+        "the length condition waits for the process gate: {out:?}"
+    );
+    // The next SYNC enters the gate and puts 0x8210 on the bus.
+    let out = node.on_frame(0x080, &[]);
+    let frame = out
+        .iter()
+        .find(|f| f.cob_id == emcy)
+        .expect("0x8210 expected at the SYNC");
+    assert_eq!(&frame.payload()[..2], &0x8210u16.to_le_bytes());
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-25 ②: the reference keeps **one** length condition per slot and
+/// `CO_error` produces no frame when the bit is already in the requested state
+/// (`CO_Emergency.c:658-666`). "Short frame, then over-long frame" must
+/// therefore emit **zero** additional frames — the latched 0x8210 stays until
+/// an exactly-sized frame acks it.
+#[test]
+fn rpdo_length_condition_is_a_single_latch() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 254); // event-driven
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    start_node(&mut node);
+    let emcy = 0x80 + u16::from(NODE);
+
+    let out = node.on_frame(0x205, &[]); // short → 0x8210
+    assert_eq!(out.iter().filter(|f| f.cob_id == emcy).count(), 1);
+    assert_eq!(&out[0].payload()[..2], &0x8210u16.to_le_bytes());
+
+    // Over-long now: the latch is already on, nothing is raised or cleared.
+    let out = node.on_frame(0x205, &[0x11, 0x22]);
+    assert!(
+        out.iter().all(|f| f.cob_id != emcy),
+        "no new frame while the condition is latched: {out:?}"
+    );
+    // …and a second short frame is equally silent.
+    let out = node.on_frame(0x205, &[]);
+    assert!(out.iter().all(|f| f.cob_id != emcy));
+
+    // Exactly-sized frame acks the latch → one reset frame.
+    let out = node.on_frame(0x205, &[0x33]);
+    let frame = out
+        .iter()
+        .find(|f| f.cob_id == emcy)
+        .expect("reset frame expected");
+    assert_eq!(&frame.payload()[..2], &[0, 0]);
+    // The condition is clear again: a later short frame raises afresh.
+    let out = node.on_frame(0x205, &[]);
+    assert_eq!(out.iter().filter(|f| f.cob_id == emcy).count(), 1);
+    assert_eq!(&out[0].payload()[..2], &0x8210u16.to_le_bytes());
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-07: CANopenNode re-arms an RPDO's `timeoutTimer` inside the
+/// apply loop, guarded by `rpdoReceived` (`CO_PDO.c:740-823,824-828`), so for
+/// a synchronous RPDO the dead-line window starts at the SYNC that makes the
+/// data visible — not when the frame was received.
+#[test]
+fn synchronous_rpdo_deadline_starts_at_the_applying_sync() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x8000_0000 | 0x205);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 0); // synchronous
+    sdo_write_u16(&mut node, Address::new(0x1400, 5), 100); // 100 ms dead line
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 2),
+            bit_length: 16,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
+    start_node(&mut node);
+
+    // Frame received and buffered at t = 0 — still not traffic for the
+    // deadman, so no window is armed.
+    let _ = node.on_frame(0x205, &[0x34, 0x12]);
+    node.poll(1);
+    assert!(
+        node.take_rpdo_timeouts().is_empty(),
+        "a buffered frame does not arm the dead line"
+    );
+
+    // The SYNC applies it; the window starts here.
+    let _ = node.on_frame(0x080, &[]);
+    node.poll(50);
+    assert_eq!(od_value(&node, Address::new(0x6000, 2)), 0x1234);
+    node.poll(140);
+    assert!(
+        node.take_rpdo_timeouts().is_empty(),
+        "100 ms window measured from the applying SYNC"
+    );
+    node.poll(160);
+    assert_eq!(node.take_rpdo_timeouts(), vec![Address::new(0x1400, 0)]);
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-03: CANopenNode's three write-time guards on the PDO
+/// communication record — a COB-ID *change* while enabled, the inhibit time
+/// and the SYNC start value while enabled — are all rejected with
+/// `ODR_INVALID_VALUE` (abort 0x0609_0030).
+#[test]
+fn comm_record_write_time_gates_match_the_reference() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // Configure TPDO1 fully while disabled, then enable it.
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254);
+    sdo_write_u16(&mut node, Address::new(0x1800, 3), 100);
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185); // enabled
+
+    // ① COB-ID change while enabled → abort (CO_PDO.c:505-510 / 891-897).
+    expect_abort(
+        &mut node,
+        Address::new(0x1800, 1),
+        &[0x86, 0x01, 0x00, 0x00],
+    );
+    // …but the canonical "disable, set the new identifier, enable" sequence
+    // is fine (the record must be *disabled* while the identifier changes).
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x8000_0000 | 0x186);
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x186);
+
+    // ② Inhibit time while enabled → abort (CO_PDO.c:949-952).
+    expect_abort(&mut node, Address::new(0x1800, 3), &[0x64, 0x00]);
+    // ③ SYNC start value while enabled → abort (CO_PDO.c:971-973).
+    expect_abort(&mut node, Address::new(0x1800, 6), &[0x05]);
+    // Event timer (sub 5) has **no** such gate in the reference (:957-963).
+    sdo_write_u16(&mut node, Address::new(0x1800, 5), 500);
+    assert_eq!(od_value(&node, Address::new(0x1800, 5)), 500);
+
+    // While disabled all three are writable again.
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x8000_0000 | 0x185);
+    sdo_write_u16(&mut node, Address::new(0x1800, 3), 100);
+    sdo_write_u8(&mut node, Address::new(0x1800, 6), 5);
+    assert_eq!(od_value(&node, Address::new(0x1800, 6)), 5);
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-09: changing only the **timer** fields (inhibit / event timer)
+/// keeps the TPDO's running state, like CANopenNode's `OD_write_18xx` cases
+/// 3/5, which only clear the corresponding timer and leave
+/// `syncCounter`/`sendRequest` alone (`CO_PDO.c:949-963`).
+#[test]
+fn timer_only_change_keeps_pdo_runtime_state() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254);
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    start_node(&mut node);
+
+    // Produce one event-driven frame, so the slot has runtime state.
+    let _ = node.on_frame(0x185, &[0x11]);
+    assert_eq!(
+        node.poll(10).iter().filter(|f| f.cob_id == 0x185).count(),
+        1
+    );
+
+    // Disable, change only the event timer, re-enable: the request latched
+    // before the change must survive (a full slot rebuild used to drop it).
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x8000_0000 | 0x185);
+    sdo_write_u16(&mut node, Address::new(0x1800, 5), 200);
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    let frames = node.poll(20);
+    assert_eq!(
+        frames.iter().filter(|f| f.cob_id == 0x185).count(),
+        1,
+        "the pending event survives a timer-only reconfiguration: {frames:?}"
+    );
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-26: enabling 0x1019 at runtime must not park an already
+/// transmitting cyclic TPDO in the SYNC-start wait — the reference consumes
+/// `syncStartValue` only while seeding a fresh slot (`CO_PDO.c:1315-1336`) and
+/// `OD_write_1019` never touches `syncCounter` (`:139-169`).
+#[test]
+fn enabling_counter_overflow_at_runtime_does_not_silence_a_running_tpdo() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 1); // SyncCyclic every SYNC
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    // Pre-set a SYNC start value while 0x1019 is still 0 (the only way to get
+    // one: the guard refuses the write while the PDO is enabled).
+    sdo_write_u8(&mut node, Address::new(0x1800, 6), 2);
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    start_node(&mut node);
+
+    // With 0x1019 == 0 the SYNC is counterless and the slot transmits.
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[]).into_iter().collect();
+    assert_eq!(
+        out.iter().filter(|f| f.cob_id == 0x185).count(),
+        1,
+        "running before 0x1019 is enabled"
+    );
+
+    // Now enable the counter overflow at runtime.
+    sdo_write_u8(&mut node, Address::new(0x1019, 0), 4);
+    // The first counted SYNC carries counter 1, which does not match the
+    // start value 2 — the TPDO must keep running instead of going silent for
+    // up to 240 SYNCs (PDO-26).
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[0x01]).into_iter().collect();
+    assert_eq!(
+        out.iter().filter(|f| f.cob_id == 0x185).count(),
+        1,
+        "a transmitting TPDO is past the one-shot SYNC-start seeding: {out:?}"
+    );
+    // And it stays in step: the next SYNC (counter 2) transmits again.
+    let out: Vec<TxFrame> = node.on_frame(0x080, &[0x02]).into_iter().collect();
+    assert_eq!(out.iter().filter(|f| f.cob_id == 0x185).count(), 1);
+}
+
+/// docs/DESIGN-DECISIONS.md PDO-24's counterpart: an **explicit** sub 2 = 0 (synchronous) still
+/// buffers the payload until the next SYNC — the change was only about what a
+/// *missing* transmission type means.
+#[test]
+fn explicit_synchronous_transmission_type_still_buffers_until_sync() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    // The record must be filled while disabled (docs/DESIGN-DECISIONS.md PDO-03).
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x8000_0000 | 0x205);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 0);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x205);
+    start_node(&mut node);
+
+    let _ = node.on_frame(0x205, &[0xAB]);
+    assert_eq!(
+        od_value(&node, Address::new(0x6000, 1)),
+        0,
+        "buffered for SYNC"
+    );
+    let _ = node.on_frame(0x080, &[]);
+    assert_eq!(od_value(&node, Address::new(0x6000, 1)), 0xAB);
+}
+
+/// docs/DESIGN-DECISIONS.md P3-17: malformed SYNC payloads (>1 byte) must not drive the
 /// synchronous machinery.
 #[test]
 fn malformed_sync_payload_is_rejected() {
@@ -1700,7 +3655,7 @@ fn malformed_sync_payload_is_rejected() {
     start_node(&mut node);
 
     // Valid empty SYNC fires; malformed 2-byte payload does not drive any
-    // TPDO (it does raise the SYNC-length emergency 0x8240, BUGS.md 八M11).
+    // TPDO (it does raise the SYNC-length emergency 0x8240, docs/DESIGN-DECISIONS.md 八M11).
     let fired: Vec<TxFrame> = node.on_frame(0x080, &[]);
     assert!(fired.iter().any(|f| f.cob_id == 0x185));
     let malformed: Vec<TxFrame> = node.on_frame(0x080, &[7, 7]);
@@ -1708,12 +3663,20 @@ fn malformed_sync_payload_is_rejected() {
         malformed.iter().all(|f| f.cob_id != 0x185),
         "malformed SYNC must not drive TPDOs: {malformed:?}"
     );
-    // BUGS.md 八M11: the width mismatch is reported as
+    // docs/DESIGN-DECISIONS.md 八M11: the width mismatch is reported as
     // CO_EMC_SYNC_DATA_LENGTH (0x8240) via the emergency channel.
     assert!(
         malformed.iter().any(|f| f.cob_id == 0x80 + u16::from(NODE)),
         "0x8240 emergency expected: {malformed:?}"
     );
+    let sync_len = malformed
+        .iter()
+        .find(|f| f.cob_id == 0x80 + u16::from(NODE))
+        .expect("0x8240 emergency expected");
+    assert_eq!(&sync_len.payload()[..2], &0x8240u16.to_le_bytes());
+    // EMC-14: [errorBit=CO_EM_SYNC_LENGTH, DLC|0x40 LE] in frame 3..8.
+    assert_eq!(sync_len.payload()[3], 0x19);
+    assert_eq!(&sync_len.payload()[4..8], &(2u32 | 0x40).to_le_bytes());
     // With 0x1019 == 0, even a one-byte SYNC is malformed (the 0x8240
     // condition is already active, so no second frame — idempotent raise).
     let one_byte: Vec<TxFrame> = node.on_frame(0x080, &[0x01]);
@@ -1723,9 +3686,11 @@ fn malformed_sync_payload_is_rejected() {
     );
 }
 
-/// BUGS.md 八M12: 0x1005 bit30 is the *gen* (SYNC producer) flag — a node
-/// declaring itself producer must still consume SYNC frames; the reserved
-/// bit29 must not match as a CAN-ID.
+/// docs/DESIGN-DECISIONS.md 八M12: 0x1005 bit30 is the *gen* (SYNC producer) flag — a node
+/// declaring itself producer must still consume SYNC frames.
+/// docs/DESIGN-DECISIONS.md SYN-02 订正本回归的后半段：保留位 29..11 与 bit31 在**消费侧被忽略**
+/// （参考 `CO_SYNC.c:272-274` 只取低 11 位），脏值只由**写时守卫**拒绝
+/// （十M4 + SYN-11），否则 EDS 预载的脏值会让节点对 SYNC 完全失聪。
 #[test]
 fn sync_cob_id_gen_bit_does_not_blind_consumer() {
     use canopen_core::datatypes::DataType;
@@ -1765,18 +3730,43 @@ fn sync_cob_id_gen_bit_does_not_blind_consumer() {
         "gen bit must not blind the SYNC consumer: {frames:?}"
     );
 
-    // Reserved bit29 set: not a valid SYNC COB-ID, must not match.
+    // Reserved bit29 set: a **write** would be rejected (十M4 / SYN-11 守卫),
+    // but the reference's consumer takes only the low 11 bits out of 0x1005
+    // (`SYNC->CAN_ID = cobIdSync & 0x7FFU`, `CO_SYNC.c:274`; bit30 is the
+    // producer flag at `:272`), so a dirty value pre-loaded by an EDS must
+    // still be consumed on COB 0x80 — docs/DESIGN-DECISIONS.md SYN-02（订正 八M12 回归的后半段：
+    // 「保留位不匹配」是本栈自创的严格判据，会让节点对 SYNC 完全失聪）。
     node.od_mut()
         .set_value(Address::new(0x1005, 0), Value::Uint(0x2000_0080))
         .unwrap();
     let frames: Vec<TxFrame> = node.on_frame(0x080, &[]);
     assert!(
-        frames.iter().all(|f| f.cob_id != 0x185),
-        "bit29-reserved value must not match: {frames:?}"
+        frames.iter().any(|f| f.cob_id == 0x185),
+        "a dirty 0x1005 must still consume the low 11 bits: {frames:?}"
+    );
+    // bit31 (disabled) is likewise ignored on the consume side.
+    node.od_mut()
+        .set_value(Address::new(0x1005, 0), Value::Uint(0x8000_0180))
+        .unwrap();
+    let frames: Vec<TxFrame> = node.on_frame(0x180, &[]);
+    assert!(
+        frames.iter().any(|f| f.cob_id == 0x185),
+        "bit31 is a write-time concern only: {frames:?}"
+    );
+    // …and the SDO write path still refuses both dirty values.
+    expect_abort(
+        &mut node,
+        Address::new(0x1005, 0),
+        &[0x80, 0x00, 0x20, 0x00],
+    );
+    expect_abort(
+        &mut node,
+        Address::new(0x1005, 0),
+        &[0x80, 0x01, 0x00, 0x80],
     );
 }
 
-/// BUGS.md P3-11: writing a mapped OD entry (via SDO) latches the
+/// docs/DESIGN-DECISIONS.md P3-11: writing a mapped OD entry (via SDO) latches the
 /// event-driven TPDO like an application request would (flagsPDO).
 #[test]
 fn od_write_triggers_event_driven_tpdo() {
@@ -1797,8 +3787,14 @@ fn od_write_triggers_event_driven_tpdo() {
     );
     start_node(&mut node);
 
-    // No poll output without a write.
-    assert!(node.poll(1000).is_empty());
+    // docs/DESIGN-DECISIONS.md P3: entering Operational emits one initial frame for an
+    // event-driven TPDO (CANopenNode latches `sendRequest` on the
+    // non-operational → operational edge, `CO_PDO.c:1345`). Drain it…
+    let initial = node.poll(1000);
+    assert_eq!(initial.len(), 1, "initial TPDO on entering Operational");
+    assert_eq!(initial[0].cob_id, 0x185);
+    // …then no further poll output without a write.
+    assert!(node.poll(1001).is_empty());
     // SDO write to the mapped object latches the event…
     sdo_write_raw(&mut node, Address::new(0x6000, 1), &[0x77]);
     let tx = node.poll(1100);
@@ -1806,7 +3802,56 @@ fn od_write_triggers_event_driven_tpdo() {
     assert_eq!(tx[0].payload()[0], 0x77);
 }
 
-/// BUGS.md P3-13: a boot-up from a node previously flagged Lost reports
+/// docs/DESIGN-DECISIONS.md P3: entering Operational sends one initial frame for every
+/// event-driven TPDO (CANopenNode latches `sendRequest = true` whenever the
+/// node is not operational, `CO_PDO.c:1345`), even with `event_timer = 0`;
+/// re-entering after Stop sends again once.
+#[test]
+fn entering_operational_sends_one_initial_event_tpdo() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x185);
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254); // event-driven
+    sdo_write_raw(&mut node, Address::new(0x1800, 5), &[0x00, 0x00]); // no event timer
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    start_node(&mut node);
+
+    let first: Vec<TxFrame> = node
+        .poll(1000)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x185)
+        .collect();
+    assert_eq!(
+        first.len(),
+        1,
+        "one initial TPDO after entering Operational"
+    );
+    assert!(
+        node.poll(1001).iter().all(|f| f.cob_id != 0x185),
+        "no repeat without an event"
+    );
+
+    // Stop and re-enter: the reference re-latches the request.
+    let _ = node.on_frame(0x000, &[0x02, NODE]);
+    let _ = node.on_frame(0x000, &[0x01, NODE]);
+    let again: Vec<TxFrame> = node
+        .poll(2000)
+        .into_iter()
+        .filter(|f| f.cob_id == 0x185)
+        .collect();
+    assert_eq!(again.len(), 1, "initial TPDO on re-entering Operational");
+}
+
+/// docs/DESIGN-DECISIONS.md P3-13: a boot-up from a node previously flagged Lost reports
 /// RemoteReset, not just Started.
 #[test]
 fn remote_reset_reported_after_timeout() {
@@ -1826,7 +3871,7 @@ fn remote_reset_reported_after_timeout() {
     );
 }
 
-/// BUGS.md B2: a configured node that has never been seen (phase Unknown)
+/// docs/DESIGN-DECISIONS.md B2: a configured node that has never been seen (phase Unknown)
 /// still reports `RemoteReset` on boot-up — CANopenNode fires
 /// `pFunctSignalRemoteReset` for every tracked entry, UNKNOWN included
 /// (`CO_HBconsumer.c:320-334`).
@@ -1849,7 +3894,7 @@ fn remote_reset_reported_from_unknown_phase() {
     );
 }
 
-/// BUGS.md P3-14: tolerance widens the supervision deadline.
+/// docs/DESIGN-DECISIONS.md P3-14: tolerance widens the supervision deadline.
 #[test]
 fn hb_tolerance_widens_deadline() {
     use canopen_core::nmt::{HbEvent, HeartbeatConsumer};
@@ -1867,7 +3912,7 @@ fn hb_tolerance_widens_deadline() {
     assert!(matches!(&loose.poll(250)[..], [HbEvent::Lost { .. }]));
 }
 
-/// BUGS.md P3-22: a frame on a COB-ID this node transmits as TPDO is treated
+/// docs/DESIGN-DECISIONS.md P3-22: a frame on a COB-ID this node transmits as TPDO is treated
 /// as self-echo and never applied to an RPDO slot.
 #[test]
 fn self_echo_tpdo_cobid_not_applied_as_rpdo() {
@@ -1920,13 +3965,24 @@ fn self_echo_tpdo_cobid_not_applied_as_rpdo() {
     );
 }
 
-/// BUGS.md P3-1 (see git history): an NMT reset must clear the SDO session state
+/// docs/DESIGN-DECISIONS.md P3-1 (see git history): an NMT reset must clear the SDO session state
 /// (`sdo.reset()` drops the in-flight transfer and the inactivity window).
 /// Otherwise the first post-reset transfer inherits the pre-reset timestamp
 /// and can be torn down by `sdo_timeout_due` while perfectly alive.
 #[test]
 fn nmt_reset_clears_sdo_session_baseline() {
     let mut node = test_node();
+    // A variable-length target: a fixed-width object rejects a declared size
+    // that differs from its width right at initiate (docs/DESIGN-DECISIONS.md SDO-08).
+    node.od_mut().insert(
+        Address::new(0x6000, 3),
+        Entry::new(
+            "blob",
+            DataType::Domain,
+            AccessType::Rw,
+            Storage::Value(Value::Bytes(Vec::new())),
+        ),
+    );
     node.boot().unwrap();
     let _ = node.on_frame(0x000, &[0x01, 0x00]); // start
     node.set_sdo_timeout(100);
@@ -1934,7 +3990,7 @@ fn nmt_reset_clears_sdo_session_baseline() {
     // Open a segmented download and leave it in flight.
     let mut client = SdoClient::new();
     let init = client
-        .write(Address::new(0x6000, 1), b"xxxxxxxxxxxxxxxxxxxx")
+        .write(Address::new(0x6000, 3), b"xxxxxxxxxxxxxxxxxxxx")
         .unwrap();
     for f in &init {
         let _ = node.on_frame(0x600 + u16::from(NODE), f);
@@ -1943,7 +3999,7 @@ fn nmt_reset_clears_sdo_session_baseline() {
     assert!(node.sdo_is_busy());
 
     // Reset communication mid-transfer: the reset re-boots automatically
-    // (BUGS.md H2), handing back the boot-up frame.
+    // (docs/DESIGN-DECISIONS.md H2), handing back the boot-up frame.
     let reset_out = node.on_frame(0x000, &[0x82, 0x00]);
     assert_eq!(reset_out.len(), 1);
     assert_eq!(reset_out[0].payload(), &[0x00]);
@@ -1952,7 +4008,7 @@ fn nmt_reset_clears_sdo_session_baseline() {
     let _ = node.on_frame(0x000, &[0x01, 0x00]);
     let mut client2 = SdoClient::new();
     let init2 = client2
-        .write(Address::new(0x6000, 1), b"yyyyyyyyyyyyyyyyyyyy")
+        .write(Address::new(0x6000, 3), b"yyyyyyyyyyyyyyyyyyyy")
         .unwrap();
     for f in &init2 {
         let _ = node.on_frame(0x600 + u16::from(NODE), f);
@@ -1967,18 +4023,28 @@ fn nmt_reset_clears_sdo_session_baseline() {
     assert!(node.sdo_is_busy());
 }
 
-/// BUGS.md C1: a session timeout tears the transfer down and returns the
+/// docs/DESIGN-DECISIONS.md C1: a session timeout tears the transfer down and returns the
 /// `0x05040000` abort naming the in-flight object for transmission
 /// (CANopenNode `CO_SDOserver.c:1076-1079,1496-1509`).
 #[test]
 fn sdo_session_timeout_emits_timeout_abort() {
     let mut node = test_node();
+    // Variable-length target (see SDO-08 above).
+    node.od_mut().insert(
+        Address::new(0x6000, 3),
+        Entry::new(
+            "blob",
+            DataType::Domain,
+            AccessType::Rw,
+            Storage::Value(Value::Bytes(Vec::new())),
+        ),
+    );
     node.boot().unwrap();
     node.set_sdo_timeout(100);
 
     let mut client = SdoClient::new();
     let init = client
-        .write(Address::new(0x6000, 1), b"xxxxxxxxxxxxxxxxxxxx")
+        .write(Address::new(0x6000, 3), b"xxxxxxxxxxxxxxxxxxxx")
         .unwrap();
     for f in &init {
         let _ = node.on_frame(0x600 + u16::from(NODE), f);
@@ -1991,12 +4057,12 @@ fn sdo_session_timeout_emits_timeout_abort() {
     let p = abort.payload();
     assert_eq!(p[0], 0x80);
     assert_eq!(u16::from_le_bytes([p[1], p[2]]), 0x6000);
-    assert_eq!(p[3], 1);
+    assert_eq!(p[3], 3);
     assert_eq!(u32::from_le_bytes([p[4], p[5], p[6], p[7]]), 0x0504_0000);
     assert!(!node.sdo_is_busy());
 }
 
-/// BUGS.md 八L14: writing 0x1019 must reject 1 (reserved) and >240
+/// docs/DESIGN-DECISIONS.md 八L14: writing 0x1019 must reject 1 (reserved) and >240
 /// (CANopenNode `OD_write_1019`), leaving the previous value intact.
 #[test]
 fn sync_counter_overflow_write_is_validated() {
@@ -2055,6 +4121,14 @@ fn rpdo_length_emergencies_raise_and_clear() {
         .find(|f| f.cob_id == emcy)
         .expect("0x8220 EMCY expected");
     assert_eq!(&frame.payload()[..2], &0x8220u16.to_le_bytes());
+    // EMC-14: manufacturer field = [errorBit, infoCode LE]; the declared
+    // length (1) rides in frame bytes 4..8, not 3..7.
+    assert_eq!(
+        frame.payload()[3],
+        0x04,
+        "CO_EM_RPDO_WRONG_LENGTH error bit"
+    );
+    assert_eq!(&frame.payload()[4..8], &1u32.to_le_bytes());
     assert_eq!(od_value(&node, Address::new(0x6000, 1)), 0x11);
 
     // Back to the declared length: the condition is cleared (reset EMCY).
@@ -2198,6 +4272,20 @@ fn sync_acyclic_ignores_sync_start_value() {
     sdo_write_raw(&mut node, Address::new(0x6000, 1), &[0x42]);
     start_node(&mut node);
 
+    // 七F1: entering Operational arms one initial frame, consumed by the
+    // first SYNC — tt=0 ignores the SYNC start value, so the counter being
+    // 2 here is irrelevant.
+    let initial: Vec<TxFrame> = node
+        .on_frame(0x080, &[2])
+        .into_iter()
+        .filter(|f| f.cob_id == 0x185)
+        .collect();
+    assert_eq!(
+        initial.len(),
+        1,
+        "entering Operational sends one initial frame"
+    );
+
     // Counter matches the start value but nothing was requested → silent.
     let unsolicited = node.on_frame(0x080, &[3]);
     assert!(
@@ -2281,4 +4369,149 @@ fn heartbeat_event_queue_is_bounded() {
     );
     node.poll(2_000_000);
     assert!(node.take_hb_events().len() <= 256);
+}
+
+#[test]
+fn emc19_disabled_emcy_does_not_stop_heartbeat_or_tpdo() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    start_node(&mut node);
+    sdo_write_u32(&mut node, Address::new(0x1014, 0), 0x8000_0000 | 0x85);
+    sdo_write_u16(&mut node, Address::new(0x1017, 0), 100);
+    let _ = node.raise_emergency(0x1111, err_reg::GENERIC, [0; 5]);
+    let frames = node.poll(1_000);
+    assert!(
+        frames.iter().any(|f| f.cob_id == 0x705),
+        "heartbeat must survive a blocked EMCY queue: {frames:?}"
+    );
+}
+
+#[test]
+fn emc20_stop_start_clears_deadline_latch_and_reset_is_queued() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1400, 1), 0x201);
+    sdo_write_u8(&mut node, Address::new(0x1400, 2), 254);
+    sdo_write_u16(&mut node, Address::new(0x1400, 5), 10);
+    sdo_write_u8(&mut node, Address::new(0x1600, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1600, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    start_node(&mut node);
+    let _ = node.on_frame(0x201, &[1]);
+    node.poll(0);
+    assert!(node.poll(11).iter().any(|f| f.cob_id == 0x85));
+    let _ = node.on_frame(0x000, &[0x02, 0x00]);
+    let _ = node.on_frame(0x000, &[0x01, 0x00]);
+    let _ = node.on_frame(0x201, &[2]);
+    let frames = node.poll(20);
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.cob_id == 0x85 && f.payload()[..2] == 0x0000u16.to_le_bytes()),
+        "Stop/Start must clear the producer latch and queue a reset: {frames:?}"
+    );
+    assert_eq!(od_value(&node, Address::new(0x1001, 0)), 0);
+}
+
+#[test]
+fn nmt16_start_before_boot_emits_bootup_and_arms_consumer() {
+    let mut node = test_node();
+    node.od_mut()
+        .set_value(Address::new(0x1016, 1), Value::Uint((42 << 16) | 10))
+        .unwrap();
+    let out = node.on_frame(0x000, &[0x01, 0x00]);
+    assert_eq!(node.nmt_state(), canopen_core::nmt::NmtState::Operational);
+    assert!(
+        out.iter()
+            .any(|f| f.cob_id == 0x705 && f.payload() == [0x00]),
+        "boot-up frame must not be lost: {out:?}"
+    );
+    let _ = node.on_frame(0x72A, &[0x05]);
+    node.poll(0);
+    let emcy = node.poll(100);
+    assert!(
+        emcy.iter()
+            .any(|f| f.cob_id == 0x85 && f.payload()[..2] == 0x8130u16.to_le_bytes()),
+        "0x1016 consumer must be armed after the race: {emcy:?}"
+    );
+}
+
+#[test]
+fn nmt17_error_driven_operational_entry_latches_event_tpdo() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    sdo_write_u32(&mut node, Address::new(0x1800, 1), 0x181);
+    sdo_write_u8(&mut node, Address::new(0x1800, 2), 254);
+    sdo_write_u8(&mut node, Address::new(0x1A00, 0), 1);
+    sdo_write_u32(
+        &mut node,
+        Address::new(0x1A00, 1),
+        MappingEntry {
+            address: Address::new(0x6000, 1),
+            bit_length: 8,
+        }
+        .to_u32(),
+    );
+    start_node(&mut node);
+    let _ = node.poll(0);
+    node.set_nmt_control(NmtControl {
+        err_on_busoff_hb: true,
+        ..NmtControl::default()
+    });
+    node.set_can_status(CanStatus {
+        bus_off: true,
+        bus_warn: false,
+    });
+    node.poll(10);
+    assert_eq!(
+        node.nmt_state(),
+        canopen_core::nmt::NmtState::PreOperational
+    );
+    node.set_nmt_control(NmtControl {
+        err_free_to_operational: true,
+        ..NmtControl::default()
+    });
+    node.set_can_status(CanStatus::default());
+    let recovered = node.poll(20);
+    assert_eq!(node.nmt_state(), canopen_core::nmt::NmtState::Operational);
+    assert!(
+        recovered.iter().any(|f| f.cob_id == 0x181),
+        "error-driven Start must latch the event-driven TPDO request: {:?}",
+        recovered.iter().map(|f| f.cob_id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pdo31_reconfigured_slots_are_sent_in_pdo_number_order() {
+    let mut node = test_node();
+    node.boot().unwrap();
+    for (comm, map, cob) in [(0x1801u16, 0x1A01u16, 0x281u32), (0x1800, 0x1A00, 0x181)] {
+        sdo_write_u32(&mut node, Address::new(comm, 1), cob);
+        sdo_write_u8(&mut node, Address::new(comm, 2), 254);
+        sdo_write_u8(&mut node, Address::new(map, 0), 1);
+        sdo_write_u32(
+            &mut node,
+            Address::new(map, 1),
+            MappingEntry {
+                address: Address::new(0x6000, 1),
+                bit_length: 8,
+            }
+            .to_u32(),
+        );
+    }
+    start_node(&mut node);
+    let order: Vec<u16> = node
+        .poll(0)
+        .into_iter()
+        .map(|f| f.cob_id)
+        .filter(|id| *id == 0x181 || *id == 0x281)
+        .collect();
+    assert_eq!(order, vec![0x181, 0x281]);
 }

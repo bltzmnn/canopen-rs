@@ -32,7 +32,7 @@
 |---|---|---|---|
 | S1 | **状态机即文档**：SDO 每个状态枚举值注释完整报文字节布局，高 nibble 编码方向/模式 | `301/CO_SDOserver.h:90-287` | Rust 状态 enum 全部带文档注释 + golden-byte 测试 |
 | S2 | **Block 下载 RX 路径直接落盘**：RX 回调内校验 seqno 连续性后直接 memcpy 进线性缓冲，不经中间暂存 | `301/CO_SDOserver.c:68-126` | block 数据段处理独立成纯函数，seqno 即时判定 |
-| S3 | **blksize 从缓冲容量自适应推导**（`(BUFFER_SIZE-2)/7`，上限 127），缓冲将满时先 flush 到 OD 再收缩子块 | `CO_SDOserver.c:1294-1299,1332-1347` | **未照搬**：接收缓冲为动态 Vec，服务端 clamp 对端提案到 1..=127，客户端恒提案 127（见 IMPLEMENTATION §5.3、BUGS.md 已知局限） |
+| S3 | **blksize 从缓冲容量自适应推导**（`(BUFFER_SIZE-2)/7`，上限 127），缓冲将满时先 flush 到 OD 再收缩子块 | `CO_SDOserver.c:1294-1299,1332-1347` | **未照搬**：接收缓冲为动态 Vec，服务端 clamp 对端提案到 1..=127，客户端恒提案 127（见 IMPLEMENTATION §5.3、DESIGN-DECISIONS.md 已知局限） |
 | S4 | **环形缓冲 alt-read 双指针**实现 block 上传流水线+CRC 复核：数据确认前不提交读指针 | `CO_fifo.h:245-296`, `CO_SDOclient.h:182-184` | 用 `BytesMut` split/冻结语义安全表达 |
 | S5 | **RPDO 同步双缓冲 + toggle 位**：以 SYNC toggle 区分"本周期"与"上一周期"数据，严格实现"同步 RPDO 在下一 SYNC 后生效"，无锁 | `CO_PDO.c:454-464,731-736`; `CO_SYNC.h:57-61` | `RpdoSlot` 双缓冲设计 |
 | S6 | **timerNext_us 协作式调度输出**贯穿所有 process 函数：process 返回"下次何时需要我"，OS 定向唤醒而非忙轮询 | `CANopen.c:1311-1503` | host 层 tokio `sleep_until(next_event)`；core 的 poll 函数返回下次到期时间 |

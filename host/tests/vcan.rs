@@ -26,7 +26,7 @@ const NODE_ID: u8 = 5;
 fn test_od() -> ObjectDictionary {
     let mut od = StandardObjects::new().device_type(0x0000_0192).build();
     install_standard_objects(&mut od, NodeId::new(NODE_ID).unwrap());
-    // BUGS.md M7: arm the heartbeat producer so the node emits periodic
+    // docs/DESIGN-DECISIONS.md M7: arm the heartbeat producer so the node emits periodic
     // heartbeats after boot — the on-bus tests subscribe *after* the server
     // thread boots, and a single boot-up frame could be consumed by the
     // socket before the subscription lands, leaving `hits` at 0 forever.
@@ -203,7 +203,7 @@ fn tpdo_payload(rx: &canopen_host::transport::Received) -> &[u8] {
     rx.payload()
 }
 
-/// BUGS.md P2-19: the high-level master API (`Network`) had zero on-bus
+/// docs/DESIGN-DECISIONS.md P2-19: the high-level master API (`Network`) had zero on-bus
 /// coverage — subscribe dispatch, panic isolation accounting, heartbeat
 /// supervision and `check()` all ran only in synthetic harnesses. This test
 /// exercises them against the same served node as `full_flow_on_vcan`.
@@ -236,7 +236,7 @@ fn network_master_api_on_vcan() {
         hb_hits.fetch_add(1, Ordering::Relaxed);
     });
 
-    // A panicking handler must not kill the RX loop (BUGS.md P1-4).
+    // A panicking handler must not kill the RX loop (docs/DESIGN-DECISIONS.md P1-4).
     network.subscribe(0x185, |_: &canopen_host::transport::Received| {
         panic!("deliberate subscriber panic");
     });

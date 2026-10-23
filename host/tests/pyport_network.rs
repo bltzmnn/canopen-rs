@@ -10,7 +10,7 @@ use canopen_core::types::NodeId;
 // 构造，故此处不重复空壳）；以下为无需总线的纯逻辑子集移植。
 
 /// test_network.py:66 — heartbeat-consumer lifecycle behind the Network
-/// surface. NOTE (BUGS.md R10-P2-15): despite its old name this never called
+/// surface. NOTE (docs/DESIGN-DECISIONS.md R10-P2-15): despite its old name this never called
 /// `check()`; real RxDeath surfacing is covered by the vcan Network test.
 /// Renamed to what it exercises.
 #[test]

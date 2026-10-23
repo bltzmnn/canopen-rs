@@ -1,24 +1,29 @@
 //! Tokio-based SocketCAN transport — the async mirror of
 //! [`crate::transport::SocketCan`]. Requires the `tokio` feature.
 //!
-//! The same SDO transaction driver semantics apply (one deadline per call,
-//! aborts mapped onto [`HostError::SdoAborted`]); awaiting replaces blocking
-//! reads and `tokio::time::timeout` enforces deadlines.
+//! The same SDO transaction driver semantics apply (the deadline is a
+//! **per-response** window that re-anchors on every response, exactly like the
+//! blocking transport — docs/DESIGN-DECISIONS.md API-01; aborts are mapped onto
+//! [`HostError::SdoAborted`]); awaiting replaces blocking reads and
+//! `tokio::time::timeout` enforces deadlines.
 
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use canopen_core::datatypes::{DataType, Value};
 use canopen_core::nmt::NmtCommand;
-use canopen_core::node::Node;
+use canopen_core::node::{CanStatus, Node};
 use canopen_core::types::Address;
 
 use crate::error::HostError;
-use crate::transport::{classify, is_valid_sdo_response, Incoming, POLL_SLICE};
+use crate::transport::{
+    can_status_from_state, classify, is_valid_sdo_response, Incoming, POLL_SLICE,
+};
 
 /// Async SocketCAN socket.
 pub struct AsyncSocketCan {
     sock: socketcan::tokio::CanSocket,
+    interface: String,
 }
 
 impl AsyncSocketCan {
@@ -36,7 +41,21 @@ impl AsyncSocketCan {
                 HostError::Io(e)
             }
         })?;
-        Ok(Self { sock })
+        let interface = interface.to_string();
+        Ok(Self { sock, interface })
+    }
+
+    /// Best-effort query of the controller state for LED/NMT inputs.
+    ///
+    /// Synchronous netlink query; call it between await points rather than on
+    /// every frame. Returns `None` when the state cannot be read.
+    #[must_use]
+    pub fn can_status(&self) -> Option<CanStatus> {
+        let state = socketcan::nl::CanInterface::open(&self.interface)
+            .ok()?
+            .state()
+            .ok()??;
+        Some(can_status_from_state(state))
     }
 
     /// Sends one classic data frame.
@@ -68,7 +87,7 @@ impl AsyncSocketCan {
         tx_cob: u16,
         deadline: Instant,
     ) -> Result<[u8; 8], HostError> {
-        // BUGS.md L4: the deadline arrives on the std clock (shared driver
+        // docs/DESIGN-DECISIONS.md L4: the deadline arrives on the std clock (shared driver
         // macro), but the wait below uses `tokio::time::timeout` — mixing
         // the two clocks directly would decouple them under
         // `tokio::time::pause()` (std time keeps advancing while tokio's is
@@ -87,7 +106,7 @@ impl AsyncSocketCan {
                 Ok(Err(e)) => return Err(e),
                 // SDO frames are always exactly 8 bytes (DLC == 8U in
                 // CANopenNode); reject zero-padded short frames (shared
-                // predicate with the blocking transport, BUGS.md M5).
+                // predicate with the blocking transport, docs/DESIGN-DECISIONS.md M5).
                 Ok(Ok(Some(Incoming::Data(rx)))) if is_valid_sdo_response(&rx, tx_cob) => {
                     return Ok(rx.data);
                 }
@@ -97,7 +116,7 @@ impl AsyncSocketCan {
     }
 
     /// Drives one shared [`Exchange`] to completion (async twin of the
-    /// blocking driver; decision logic lives in the common core, BUGS.md
+    /// blocking driver; decision logic lives in the common core, docs/DESIGN-DECISIONS.md
     /// m12).
     async fn drive_exchange(
         &mut self,

@@ -6,7 +6,7 @@
 //! inquiry responses carry the requested 32-bit value little-endian in
 //! bytes 1..5.
 //!
-//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! NOTE (docs/DESIGN-DECISIONS.md M9): the golden frames below are hand-transcribed from
 //! python-canopen's suite and are **not** re-checked by `cargo test` against
 //! `ref/`. After touching any codec, run
 //! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the

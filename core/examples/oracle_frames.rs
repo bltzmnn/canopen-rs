@@ -4,7 +4,7 @@
 //! operations the oracle drives through python-canopen, plus CRC-16/XMODEM
 //! values over several payloads. The python oracle runs this example and
 //! diffs its output against python-canopen's live frames — replacing the
-//! hand-transcribed `EXPECTED_FRAMES` constants (`BUGS.md` TH1/TH2).
+//! hand-transcribed `EXPECTED_FRAMES` constants (`docs/DESIGN-DECISIONS.md` TH1/TH2).
 //!
 //! Output: one line per operation, `name hex hex …` (space-separated frame
 //! bytes); CRC lines are `crc <label> <hex16>`.
@@ -116,7 +116,7 @@ fn main() {
     // --- CRC-16/XMODEM vectors for the end-to-end cross-check ----------------
     // Each line also carries the payload hex so the oracle can recompute
     // `binascii.crc_hqx(payload, 0)` over the identical bytes and diff
-    // against our value (`BUGS.md` TH2).
+    // against our value (`docs/DESIGN-DECISIONS.md` TH2).
     let vectors: [(&str, &[u8]); 4] = [
         ("empty", b""),
         ("check", b"123456789"),

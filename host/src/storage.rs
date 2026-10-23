@@ -2,8 +2,23 @@
 //! implementation — the Linux counterpart of CANopenNode's
 //! `CO_storageLinux.c`.
 //!
-//! Format: line-based, one persisted entry per line,
-//! `<index-hex> <sub-dec> <len> <hex bytes…>`, preceded by a `v1` marker.
+//! Format (v2): line-based, one persisted entry per line, preceded by a
+//! `v2` marker:
+//!
+//! ```text
+//! # canopen-rs parameter storage v2
+//! <index-hex> <sub-dec> <len> <hex bytes…> <crc16>
+//! ```
+//!
+//! The CRC16 (XMODEM/CCITT init 0, the same polynomial as CANopenNode's
+//! `crc16_ccitt(…, 0)`) covers the canonical text of all fields before it.
+//! Writes are verified by re-reading the temp file before the atomic rename,
+//! and corruption found while loading is reported instead of silently
+//! skipped (`docs/DESIGN-DECISIONS.md` G7). Legacy v1 files (no CRC) are still readable, and
+//! they are **trusted verbatim**: a v1 line has no checksum, so a flipped hex
+//! nibble is structurally valid and is applied as written, with nothing to
+//! count as `corrupt`/`stale` (docs/DESIGN-DECISIONS.md HOST-06). Re-saving through this backend
+//! upgrades the file to v2.
 //! Dependency-free by design (no serde).
 
 use std::fs;
@@ -11,13 +26,42 @@ use std::path::{Path, PathBuf};
 
 use canopen_core::datatypes::Value;
 use canopen_core::object_dictionary::ObjectDictionary;
+use canopen_core::sdo::block::crc16;
 use canopen_core::storage::ParameterStorage;
 use canopen_core::types::{Address, Error, Result};
 
-/// 单条参数的最大字节数上限（BUGS.md M7）：`read_entries` 曾用文件里的
+/// Current on-disk format version.
+const FORMAT_VERSION: u8 = 2;
+
+/// Comment/version marker prefix shared by every format version.
+const VERSION_MARKER: &str = "# canopen-rs parameter storage v";
+
+/// 单条参数的最大字节数上限（docs/DESIGN-DECISIONS.md M7）：`read_entries` 曾用文件里的
 /// `len` 直接 `with_capacity(len)`，损坏/恶意的存储文件传入超大 `len`
 /// （如 `4294967295`）会尝试分配约 4GB。超过此上限的行按坏行跳过。
 const MAX_PARAM_LEN: usize = 8192;
+
+/// Parses one data line's canonical fields (without the CRC token):
+/// `<index-hex> <sub-dec> <len> <hex bytes…>`. `None` on any structural
+/// damage — malformed header, oversized/negative `len`, wrong number of
+/// data tokens (docs/DESIGN-DECISIONS.md H2/M7).
+fn parse_line(fields: &[&str]) -> Option<(Address, Vec<u8>)> {
+    let (Some(index), Some(sub), Some(len)) = (
+        fields.first().and_then(|p| u16::from_str_radix(p, 16).ok()),
+        fields.get(1).and_then(|p| p.parse::<u8>().ok()),
+        fields.get(2).and_then(|p| p.parse::<usize>().ok()),
+    ) else {
+        return None;
+    };
+    if len > MAX_PARAM_LEN || fields.len() != 3 + len {
+        return None;
+    }
+    let mut data = Vec::with_capacity(len);
+    for chunk in &fields[3..] {
+        data.push(u8::from_str_radix(chunk, 16).ok()?);
+    }
+    Some((Address::new(index, sub), data))
+}
 
 /// File-backed parameter storage. Clones cheaply; all state is the file.
 #[derive(Debug, Clone)]
@@ -32,99 +76,111 @@ impl FileStorage {
         Self { path }
     }
 
-    fn read_entries(&self) -> Result<Vec<(Address, Vec<u8>)>> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(Error::Io(format!("reading {}: {e}", self.path.display()))),
-        };
+    /// Whole file, or `None` when it does not exist yet.
+    fn file_text(&self) -> Result<Option<String>> {
+        match fs::read_to_string(&self.path) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(format!("reading {}: {e}", self.path.display()))),
+        }
+    }
+
+    /// Detected format version (1 for legacy/unmarked files), rejecting
+    /// files written by an incompatible future format instead of misparsing
+    /// them line by line (`docs/DESIGN-DECISIONS.md` P3-40). The marker is searched across the
+    /// whole file so a hand-edited comment header (any `#` line) cannot make
+    /// a valid file look like a future format (`docs/DESIGN-DECISIONS.md` #17).
+    fn file_version(text: &str) -> Result<u8> {
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(version) = line.strip_prefix(VERSION_MARKER) {
+                return match version {
+                    "1" => Ok(1),
+                    "2" => Ok(2),
+                    _ => Err(Error::Other(
+                        "unsupported storage file version (expected v1 or v2)",
+                    )),
+                };
+            }
+        }
+        // No version marker at all: either an old file or one whose header
+        // was edited; parse it as v1.
+        Ok(1)
+    }
+
+    /// Parses entries, returning the good ones plus the number of corrupt
+    /// lines. Corrupt lines are still skipped individually (one bad row must
+    /// not hide the good ones, `docs/DESIGN-DECISIONS.md` P3-40) but the count is propagated
+    /// so corruption is never silent (`docs/DESIGN-DECISIONS.md` G7). For v2 files the
+    /// trailing CRC16 must match the canonical text of the preceding fields
+    /// (CO_storageLinux.c:78-100 uses the same `crc16_ccitt(…, 0)`).
+    fn parse_entries(text: &str, version: u8) -> (Vec<(Address, Vec<u8>)>, usize) {
         let mut out = Vec::new();
-        // Uniform per-line tolerance (BUGS.md P3-40): a corrupt field skips
-        // exactly that line — whether the damage is in the address fields or
-        // the data bytes — so one bad row can never hide all good ones.
+        let mut corrupt = 0usize;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let mut parts = line.split_whitespace();
-            let (Some(index), Some(sub), Some(len)) = (
-                parts.next().and_then(|p| u16::from_str_radix(p, 16).ok()),
-                parts.next().and_then(|p| p.parse::<u8>().ok()),
-                parts.next().and_then(|p| p.parse::<usize>().ok()),
-            ) else {
-                continue; // malformed header fields: skip the line
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let (fields, expected_crc) = if version >= 2 {
+                let Some((last, head)) = tokens.split_last() else {
+                    corrupt += 1;
+                    continue;
+                };
+                if last.len() != 4 || !last.chars().all(|c| c.is_ascii_hexdigit()) {
+                    corrupt += 1;
+                    continue;
+                }
+                let crc = u16::from_str_radix(last, 16).expect("validated hex digits above");
+                (head, Some(crc))
+            } else {
+                (tokens.as_slice(), None)
             };
-            // BUGS.md M7: 损坏/恶意的 `len` 会导致无上限分配（DoS/OOM）。
-            // 超过上限的行按坏行跳过，既不预分配也不解析其数据字节。
-            if len > MAX_PARAM_LEN {
+            let Some(entry) = parse_line(fields) else {
+                corrupt += 1;
                 continue;
-            }
-            let mut data = Vec::with_capacity(len.min(MAX_PARAM_LEN));
-            let mut bad = false;
-            for chunk in parts.by_ref().take(len) {
-                match u8::from_str_radix(chunk, 16) {
-                    Ok(b) => data.push(b),
-                    Err(_) => {
-                        bad = true;
-                        break;
-                    }
+            };
+            if let Some(expected) = expected_crc {
+                let canonical = fields.join(" ");
+                if crc16(canonical.as_bytes()) != expected {
+                    corrupt += 1;
+                    continue;
                 }
             }
-            // BUGS.md H2: a line carrying MORE hex tokens than `len` is
-            // corrupt — `parts.take(len)` would silently drop the excess, so
-            // a damaged row whose first `len` bytes happened to be valid was
-            // loaded as a clean entry. Reject it like any other bad line.
-            if bad || data.len() != len || parts.next().is_some() {
-                continue; // corrupt/short data body: skip the line
-            }
-            out.push((Address::new(index, sub), data));
+            out.push(entry);
         }
-        Ok(out)
-    }
-
-    /// Rejects files written by an incompatible future format instead of
-    /// misparsing them line by line (`BUGS.md` P3-40). The version marker is
-    /// searched across the whole file so a hand-edited comment header (any
-    /// `#` line) cannot make a valid v1 file look like a future format
-    /// (`BUGS.md` #17); `read_entries` tolerates arbitrary comment lines.
-    fn check_version(&self) -> Result<()> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::Io(format!("reading {}: {e}", self.path.display()))),
-        };
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(version) = line.strip_prefix("# canopen-rs parameter storage v") {
-                if version != "1" {
-                    // `Error::Other` carries a static message (core types).
-                    return Err(Error::Other(
-                        "unsupported storage file version (expected v1)",
-                    ));
-                }
-                return Ok(());
-            }
-        }
-        // No version marker at all: either an old file or one whose header
-        // was edited; let the tolerant line parser deal with it.
-        Ok(())
+        (out, corrupt)
     }
 
     fn write_entries(&self, entries: &[(Address, &[u8])]) -> Result<()> {
-        let mut out = String::from("# canopen-rs parameter storage v1\n");
+        // docs/DESIGN-DECISIONS.md 七F7: `parse_line` refuses `len > MAX_PARAM_LEN`, so a
+        // larger persistent entry written out here could never be read
+        // back — the post-write verification below would fail the whole
+        // save with an opaque "corrupt line" error. Reject it up front with
+        // the real reason.
         for (addr, bytes) in entries {
-            let hex_bytes = bytes
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            out.push_str(&format!(
-                "{:04x} {:03} {:02} {hex_bytes}\n",
-                addr.index,
-                addr.subindex,
-                bytes.len()
-            ));
+            if bytes.len() > MAX_PARAM_LEN {
+                return Err(Error::Io(format!(
+                    "persistent entry {:#06x}:{} is {} bytes, exceeding the \
+                     {MAX_PARAM_LEN} byte storage limit",
+                    addr.index,
+                    addr.subindex,
+                    bytes.len()
+                )));
+            }
+        }
+        let mut out = format!("{VERSION_MARKER}{FORMAT_VERSION}\n");
+        for (addr, bytes) in entries {
+            let mut tokens: Vec<String> = vec![
+                format!("{:04x}", addr.index),
+                format!("{:03}", addr.subindex),
+                format!("{:02}", bytes.len()),
+            ];
+            tokens.extend(bytes.iter().map(|b| format!("{b:02x}")));
+            let canonical = tokens.join(" ");
+            let crc = crc16(canonical.as_bytes());
+            out.push_str(&format!("{canonical} {crc:04x}\n"));
         }
         let parent = self.path.parent();
         if parent.is_some_and(|p| !p.as_os_str().is_empty()) {
@@ -137,7 +193,7 @@ impl FileStorage {
         // process-unique AND per-call unique: `FileStorage` is Clone-able
         // and savers may run on multiple threads, so a bare pid would let
         // two same-process instances clobber each other's staging file
-        // (BUGS.md #16).
+        // (docs/DESIGN-DECISIONS.md #16).
         static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = self
@@ -147,18 +203,44 @@ impl FileStorage {
         // Flush to stable storage before the rename closes the power-loss
         // window where the rename is durable but the data is not
         // (CANopenNode relies on ext4 heuristics here; we do better,
-        // BUGS.md P3-41).
-        if let Ok(f) = fs::File::open(&tmp) {
-            let _ = f.sync_all();
+        // docs/DESIGN-DECISIONS.md P3-41).
+        fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::Io(format!("syncing {}: {e}", tmp.display())))?;
+        // Verify what landed on disk before replacing the live file
+        // (CO_storageLinux.c:78-100): a truncated or garbled temp must
+        // never be renamed over a good parameter file (`docs/DESIGN-DECISIONS.md` G7).
+        let written = match fs::read_to_string(&tmp) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(Error::Io(format!("reading back {}: {e}", tmp.display())));
+            }
+        };
+        let (verified, corrupt) = Self::parse_entries(&written, FORMAT_VERSION);
+        if corrupt != 0 || verified.len() != entries.len() {
+            let _ = fs::remove_file(&tmp);
+            return Err(Error::Io(format!(
+                "storage write verification failed for {}: {corrupt} corrupt line(s), {} of {} entries readable",
+                self.path.display(),
+                verified.len(),
+                entries.len()
+            )));
         }
         fs::rename(&tmp, &self.path)
-            .map_err(|e| Error::Io(format!("renaming {}: {e}", self.path.display())))
+            .map_err(|e| Error::Io(format!("renaming {}: {e}", self.path.display())))?;
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty());
+        let dir = parent.unwrap_or_else(|| std::path::Path::new("."));
+        fs::File::open(dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::Io(format!("syncing directory {}: {e}", dir.display())))?;
+        Ok(())
     }
 }
 
 impl ParameterStorage for FileStorage {
     fn save(&self, od: &ObjectDictionary) -> Result<()> {
-        // BUGS.md M8: 条目编码失败（如取值越界 `encode_as` 报错）曾通过
+        // docs/DESIGN-DECISIONS.md M8: 条目编码失败（如取值越界 `encode_as` 报错）曾通过
         // `.ok()?` 静默从保存集合跳过，但 `save()` 仍返回 `Ok(())`，重载时
         // 该对象回到默认值形成隐蔽数据丢失。改为与 `load`/`reset` 一致：
         // 记录首个编码错误并在最后返回，其余条目照常编码。
@@ -181,7 +263,7 @@ impl ParameterStorage for FileStorage {
                     // requires exactly `fixed_size()` bytes on
                     // load, and minimal-width encoding of e.g.
                     // `Unsigned16 = 0` produced 1 byte — silently
-                    // never restored (`BUGS.md` P2-1).
+                    // never restored (`docs/DESIGN-DECISIONS.md` P2-1).
                     let mut buf = vec![0u8; n];
                     match value.encode_as(entry.data_type, &mut buf) {
                         Ok(_) => buf,
@@ -200,7 +282,7 @@ impl ParameterStorage for FileStorage {
                     // written as UTF-16LE (CiA 306 / python-canopen), not
                     // as the value's minimal UTF-8 encoding — otherwise a
                     // reload turns `Str` into `Bytes` and every SDO upload
-                    // corrupts non-ASCII text (BUGS.md 八M5, cf. L7).
+                    // corrupts non-ASCII text (docs/DESIGN-DECISIONS.md 八M5, cf. L7).
                     let n = value.encoded_len_as(entry.data_type);
                     let mut buf = vec![0u8; n];
                     match value.encode_as(entry.data_type, &mut buf) {
@@ -231,12 +313,17 @@ impl ParameterStorage for FileStorage {
     }
 
     fn load(&self, od: &mut ObjectDictionary) -> Result<()> {
-        self.check_version()?;
+        let Some(text) = self.file_text()? else {
+            return Ok(()); // no store yet: defaults stay
+        };
+        let version = Self::file_version(&text)?;
+        let (entries, corrupt) = Self::parse_entries(&text, version);
         // A single out-of-range/stale value must not abort the whole load —
         // remember the first failure and keep restoring the rest, matching
-        // `reset()`'s strategy (`BUGS.md` #18).
+        // `reset()`'s strategy (`docs/DESIGN-DECISIONS.md` #18).
         let mut first_err: Option<Error> = None;
-        for (addr, bytes) in self.read_entries()? {
+        let mut stale = 0usize;
+        for (addr, bytes) in entries {
             let Some(entry) = od.entry(addr).cloned() else {
                 continue; // object vanished from the dictionary since save
             };
@@ -246,8 +333,30 @@ impl ParameterStorage for FileStorage {
                     Err(e) if first_err.is_none() => first_err = Some(e),
                     Err(_) => {}
                 },
-                Err(_) => continue, // stale entry with mismatched type/length
+                Err(_) => {
+                    // docs/DESIGN-DECISIONS.md HOST-02: a mismatch means the saved line is
+                    // *stale* (the entry's type/width changed since the
+                    // store). Skipping it silently contradicted the module's
+                    // "corruption is reported, never silent" promise, so it is
+                    // counted and reported below.
+                    stale += 1;
+                }
             }
+        }
+        // Corruption is reported, never silent (`docs/DESIGN-DECISIONS.md` G7) — the good
+        // entries above are still applied.
+        if corrupt != 0 || stale != 0 {
+            // docs/DESIGN-DECISIONS.md HOST-07: keep the per-entry `set_value` failure (the one
+            // class that says the *value* was bad, not the line's syntax) in
+            // the message instead of discarding it behind a line count.
+            let detail = first_err
+                .as_ref()
+                .map_or_else(String::new, |e| format!("; first rejected entry: {e}"));
+            return Err(Error::Io(format!(
+                "parameter storage {}: {corrupt} corrupt line(s) and {stale} stale entr{} skipped{detail}",
+                self.path.display(),
+                if stale == 1 { "y" } else { "ies" },
+            )));
         }
         match first_err {
             Some(e) => Err(e),
@@ -257,7 +366,7 @@ impl ParameterStorage for FileStorage {
 
     /// Restores all groups from the single backing file: per-group files are
     /// a future refinement; group granularity is passed through for
-    /// interface compatibility (`BUGS.md` P2-13).
+    /// interface compatibility (`docs/DESIGN-DECISIONS.md` P2-13).
     fn reset(
         &self,
         od: &mut ObjectDictionary,
@@ -269,7 +378,7 @@ impl ParameterStorage for FileStorage {
         // half-reset OD plus a stale store: we keep going, remember the
         // first failure and *still* clear the stored set afterwards so a
         // subsequent load cannot re-apply old parameters on top of the
-        // partial reset (BUGS.md P3-55).
+        // partial reset (docs/DESIGN-DECISIONS.md P3-55).
         let mut first_err: Option<Error> = None;
         for (addr, default_entry) in defaults.iter() {
             let Some(current) = od.entry(*addr) else {

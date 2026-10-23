@@ -4,7 +4,7 @@
 //! loopback. Deviations from python behaviour are documented inline and in
 //! docs/EXTENSIONS.md 批次 D 差异表 D1–D4.
 //!
-//! NOTE (BUGS.md M9): the golden frames below are hand-transcribed from
+//! NOTE (docs/DESIGN-DECISIONS.md M9): the golden frames below are hand-transcribed from
 //! python-canopen's suite and are **not** re-checked by `cargo test` against
 //! `ref/`. After touching any codec, run
 //! `python3 tools/interop/python_canopen_oracle.py` (8/8) to re-validate the
@@ -377,21 +377,23 @@ fn real_default_value() {
     }
 }
 
-/// test_local.py:65 — zero-length string read. D2 adaptation: we return an
-/// empty string instead of aborting with 0x08000024.
+/// test_local.py:65 — zero-length string read. D2 adaptation was to return an
+/// empty string instead of aborting; docs/DESIGN-DECISIONS.md 审-S2 aligned the server with
+/// both references (CANopenNode `CO_SDOserver.c:557-563` aborts
+/// `0x0604_0047`, python `sdo/server.py:68-72` aborts `0x0800_0024`) — the
+/// CANopenNode code is used, so the read surfaces an abort.
 #[test]
-fn zero_length_read_returns_empty_string() {
+fn zero_length_read_aborts() {
     let mut bus = Bus::new();
     boot_all(&mut bus);
     bus.node(SLAVE_A)
         .od_mut()
         .set_value(Address::new(0x1008, 0), Value::Str(String::new()))
         .unwrap();
-    assert_eq!(
-        bus.sdo_read(SLAVE_A, Address::new(0x1008, 0), DataType::VisibleString)
-            .unwrap(),
-        Value::Str(String::new())
-    );
+    match bus.sdo_read(SLAVE_A, Address::new(0x1008, 0), DataType::VisibleString) {
+        Err(SdoAbortCode::GeneralInternalIncompatibility) => {}
+        other => panic!("expected 0x0604_0047 abort, got {other:?}"),
+    }
 }
 
 /// test_local.py:72 — segmented upload after renaming.
